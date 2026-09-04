@@ -36,8 +36,13 @@ going to validate.
 
 ### Test conventions
 
+- Method-specific tests target command preconditions: one minimal test per
+  precondition branch, asserting the method's own error variant.
+- Aggregate and child-entity invariants are tested at initialization:
+  aggregate invariants via `reconstitute`, child-entity invariants via their
+  constructors. Every method re-runs initialization, so these tests are
+  sufficient for all methods.
 - Derive numeric expectations from named constants (e.g. `MAX_ALLOCATION`),
   not literals.
 - Seed consumption through spending commands, or `reconstitute` when testing
   the repository path; keep a snapshot → reconstitute roundtrip test.
-- No inline comments.
