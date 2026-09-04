@@ -14,6 +14,7 @@ pub struct Account {
 struct Spending {
     allocation: u8,
     spent: f32,
+    surplus: f32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -26,6 +27,7 @@ pub struct AccountState {
 pub struct CategoryState {
     pub allocation: u8,
     pub spent: f32,
+    pub surplus: f32,
 }
 
 impl Account {
@@ -33,8 +35,8 @@ impl Account {
         if self.categories.contains_key(name) {
             return Err(AddCategoryError::DuplicateCategory(name.to_string()));
         }
-        let spending =
-            Spending::new(allocation, 0.0).map_err(|e| AddCategoryError::Aggregate(e.into()))?;
+        let spending = Spending::new(allocation, 0.0, 0.0)
+            .map_err(|e| AddCategoryError::Aggregate(e.into()))?;
         let mut categories = self.categories.clone();
         categories.insert(name.to_string(), spending);
         Self::new(self.balance, categories).map_err(|e| AddCategoryError::Aggregate(e.into()))
@@ -48,25 +50,27 @@ impl Account {
         if spending.spent > 0.0 {
             return Err(RemoveCategoryError::CategoryHasSpending(name.to_string()));
         }
+        if spending.surplus > 0.0 {
+            return Err(RemoveCategoryError::CategoryHasSurplus(name.to_string()));
+        }
         categories.remove(name);
         Self::new(self.balance, categories).map_err(|e| e.into())
     }
 
-    pub fn transfer_spent(&self, from: &str, to: &str) -> Result<Self, TransferSpentError> {
-        if from == to {
-            return Err(TransferSpentError::SameCategory(from.to_string()));
+    pub fn rollover(&self, income: f32) -> Result<Self, RolloverError> {
+        if income < 0.0 {
+            return Err(RolloverError::NegativeIncome);
         }
         let mut categories = self.categories.clone();
-        if !categories.contains_key(from) {
-            return Err(TransferSpentError::SourceCategoryNotFound(from.to_string()));
+        let mut flushed = 0.0;
+        for spending in categories.values_mut() {
+            let budget = self.balance * (spending.allocation as f32 / MAX_ALLOCATION as f32);
+            let increment = budget - spending.spent;
+            spending.surplus += increment;
+            spending.spent = 0.0;
+            flushed += increment;
         }
-        if !categories.contains_key(to) {
-            return Err(TransferSpentError::TargetCategoryNotFound(to.to_string()));
-        }
-        let spent = categories.get(from).expect("source checked").spent;
-        categories.get_mut(from).expect("source checked").spent = 0.0;
-        categories.get_mut(to).expect("target checked").spent += spent;
-        Self::new(self.balance, categories).map_err(|e| e.into())
+        Self::new(income + (self.balance - flushed), categories).map_err(|e| e.into())
     }
 
     pub fn spend(&self, category: &str, amount: f32) -> Result<Self, AccountSpendError> {
@@ -78,6 +82,45 @@ impl Account {
             .get_mut(category)
             .ok_or_else(|| AccountSpendError::CategoryNotFound(category.to_string()))?;
         spending.spent += amount;
+        Self::new(self.balance, categories).map_err(|e| e.into())
+    }
+
+    pub fn consume_spent(&self, category: &str) -> Result<Self, ConsumeSpentError> {
+        let mut categories = self.categories.clone();
+        let spending = categories
+            .get_mut(category)
+            .ok_or_else(|| ConsumeSpentError::CategoryNotFound(category.to_string()))?;
+        let spent = spending.spent;
+        spending.spent = 0.0;
+        Self::new(self.balance - spent, categories).map_err(|e| e.into())
+    }
+
+    pub fn consume_surplus(&self, category: &str) -> Result<Self, ConsumeSurplusError> {
+        let mut categories = self.categories.clone();
+        let spending = categories
+            .get_mut(category)
+            .ok_or_else(|| ConsumeSurplusError::CategoryNotFound(category.to_string()))?;
+        let surplus = spending.surplus;
+        spending.surplus = 0.0;
+        Self::new(self.balance + surplus, categories).map_err(|e| e.into())
+    }
+
+    pub fn transfer_surplus(&self, from: &str, to: &str) -> Result<Self, TransferSurplusError> {
+        if from == to {
+            return Err(TransferSurplusError::SameCategory(from.to_string()));
+        }
+        let mut categories = self.categories.clone();
+        if !categories.contains_key(from) {
+            return Err(TransferSurplusError::SourceCategoryNotFound(
+                from.to_string(),
+            ));
+        }
+        if !categories.contains_key(to) {
+            return Err(TransferSurplusError::TargetCategoryNotFound(to.to_string()));
+        }
+        let surplus = categories.get(from).expect("source checked").surplus;
+        categories.get_mut(from).expect("source checked").surplus = 0.0;
+        categories.get_mut(to).expect("target checked").surplus += surplus;
         Self::new(self.balance, categories).map_err(|e| e.into())
     }
 
@@ -107,8 +150,8 @@ impl Account {
         let categories = allocations
             .into_iter()
             .map(|(name, allocation)| {
-                let spent = self.categories.get(&name).expect("keys matched").spent;
-                Spending::new(allocation, spent).map(|s| (name, s))
+                let spending = self.categories.get(&name).expect("keys matched");
+                Spending::new(allocation, spending.spent, spending.surplus).map(|s| (name, s))
             })
             .collect::<Result<HashMap<_, _>, _>>()
             .map_err(|e| AccountReallocationError::Aggregate(e.into()))?;
@@ -128,6 +171,7 @@ impl Account {
                         CategoryState {
                             allocation: spending.allocation,
                             spent: spending.spent,
+                            surplus: spending.surplus,
                         },
                     )
                 })
@@ -140,7 +184,8 @@ impl Account {
             .categories
             .into_iter()
             .map(|(name, category)| {
-                Spending::new(category.allocation, category.spent).map(|s| (name, s))
+                Spending::new(category.allocation, category.spent, category.surplus)
+                    .map(|s| (name, s))
             })
             .collect::<Result<HashMap<_, _>, _>>()?;
         Self::new(state.balance, categories).map_err(|e| e.into())
@@ -167,10 +212,15 @@ impl Default for Account {
 }
 
 impl Spending {
-    pub fn new(allocation: u8, spent: f32) -> Result<Self, SpendingNewError> {
+    pub fn new(allocation: u8, spent: f32, surplus: f32) -> Result<Self, SpendingNewError> {
         invariants::check_allocation_limit(allocation)?;
         invariants::check_negative_spending(spent)?;
-        Ok(Self { allocation, spent })
+        invariants::check_negative_surplus(surplus)?;
+        Ok(Self {
+            allocation,
+            spent,
+            surplus,
+        })
     }
 }
 
@@ -202,11 +252,14 @@ mod invariants {
     ) -> Result<(), AccountNewError> {
         let balance_per_allocation = balance / MAX_ALLOCATION as f32;
         for (name, category) in categories {
-            if category.spent > balance_per_allocation * category.allocation as f32 {
+            if category.spent
+                > balance_per_allocation * category.allocation as f32 + category.surplus
+            {
                 return Err(AccountNewError::SpendingExceedsAllocation(
                     name.clone(),
                     category.spent,
                     category.allocation as f32,
+                    category.surplus,
                 ));
             }
         }
@@ -226,6 +279,13 @@ mod invariants {
         }
         Ok(())
     }
+
+    pub(super) fn check_negative_surplus(surplus: f32) -> Result<(), SpendingNewError> {
+        if surplus < 0.0 {
+            return Err(SpendingNewError::NegativeSurplus(surplus));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Error, Debug)]
@@ -236,8 +296,8 @@ pub enum AccountNewError {
     #[error("total allocation ({0}) exceeds the limit ({MAX_ALLOCATION})")]
     TotalAllocations(u16),
 
-    #[error("category {0} spending ({1}) exceeds the allocation ({2})")]
-    SpendingExceedsAllocation(String, f32, f32),
+    #[error("category {0} spending ({1}) exceeds the allocation ({2}) plus surplus ({3})")]
+    SpendingExceedsAllocation(String, f32, f32, f32),
 }
 
 #[derive(Error, Debug)]
@@ -296,12 +356,42 @@ pub enum RemoveCategoryError {
     #[error("category {0} still has spending")]
     CategoryHasSpending(String),
 
+    #[error("category {0} still has surplus")]
+    CategoryHasSurplus(String),
+
     #[error(transparent)]
     AccountInitialization(#[from] AccountNewError),
 }
 
 #[derive(Error, Debug)]
-pub enum TransferSpentError {
+pub enum RolloverError {
+    #[error("income amount is negative")]
+    NegativeIncome,
+
+    #[error(transparent)]
+    AccountInitialization(#[from] AccountNewError),
+}
+
+#[derive(Error, Debug)]
+pub enum ConsumeSpentError {
+    #[error("category {0} does not exist")]
+    CategoryNotFound(String),
+
+    #[error(transparent)]
+    AccountInitialization(#[from] AccountNewError),
+}
+
+#[derive(Error, Debug)]
+pub enum ConsumeSurplusError {
+    #[error("category {0} does not exist")]
+    CategoryNotFound(String),
+
+    #[error(transparent)]
+    AccountInitialization(#[from] AccountNewError),
+}
+
+#[derive(Error, Debug)]
+pub enum TransferSurplusError {
     #[error("transfer source and target are the same: {0}")]
     SameCategory(String),
 
@@ -322,6 +412,9 @@ pub enum SpendingNewError {
 
     #[error("spending ({0}) is negative")]
     NegativeSpending(f32),
+
+    #[error("surplus ({0}) is negative")]
+    NegativeSurplus(f32),
 }
 
 #[cfg(test)]
@@ -354,6 +447,7 @@ mod account_tests {
             &CategoryState {
                 allocation: 10,
                 spent: 0.0,
+                surplus: 0.0,
             }
         );
     }
@@ -396,58 +490,209 @@ mod account_tests {
     }
 
     #[test]
-    fn transfer_spent_succeeds() {
+    fn remove_category_cant_remove_with_surplus() {
+        let account = account_with(10000.0, &[("test", MAX_ALLOCATION / 2)]);
+        let account = account.rollover(0.0).unwrap();
+        assert!(matches!(
+            account.remove_category("test"),
+            Err(RemoveCategoryError::CategoryHasSurplus(_))
+        ));
+    }
+
+    #[test]
+    fn remove_after_transferring_surplus() {
         let account = account_with(
             10000.0,
-            &[("a", MAX_ALLOCATION / 4), ("b", MAX_ALLOCATION / 4)],
+            &[("a", MAX_ALLOCATION / 2), ("b", MAX_ALLOCATION / 4)],
         );
-        let account = account.spend("a", 500.0).unwrap();
-        let account = account.transfer_spent("a", "b").unwrap();
-        let state = account.snapshot();
-        assert_eq!(state.categories.get("a").unwrap().spent, 0.0);
-        assert_eq!(state.categories.get("b").unwrap().spent, 500.0);
-        assert_eq!(state.balance, 10000.0);
-    }
-
-    #[test]
-    fn transfer_spent_same_category() {
-        let account = account_with(10000.0, &[("a", MAX_ALLOCATION / 4)]);
-        assert!(matches!(
-            account.transfer_spent("a", "a"),
-            Err(TransferSpentError::SameCategory(_))
-        ));
-    }
-
-    #[test]
-    fn transfer_spent_source_not_found() {
-        let account = account_with(10000.0, &[("a", MAX_ALLOCATION / 4)]);
-        assert!(matches!(
-            account.transfer_spent("savings", "a"),
-            Err(TransferSpentError::SourceCategoryNotFound(_))
-        ));
-    }
-
-    #[test]
-    fn transfer_spent_target_not_found() {
-        let account = account_with(10000.0, &[("a", MAX_ALLOCATION / 4)]);
-        assert!(matches!(
-            account.transfer_spent("a", "savings"),
-            Err(TransferSpentError::TargetCategoryNotFound(_))
-        ));
-    }
-
-    #[test]
-    fn remove_after_transferring_spent() {
-        let account = account_with(
-            10000.0,
-            &[("a", MAX_ALLOCATION / 4), ("b", MAX_ALLOCATION / 4)],
-        );
-        let account = account.spend("a", 500.0).unwrap();
-        let account = account.transfer_spent("a", "b").unwrap();
+        let account = account.rollover(0.0).unwrap();
+        let account = account.transfer_surplus("a", "b").unwrap();
         let account = account.remove_category("a").unwrap();
         let state = account.snapshot();
         assert!(!state.categories.contains_key("a"));
-        assert_eq!(state.categories.get("b").unwrap().spent, 500.0);
+        let surplus_b = 10000.0 * (MAX_ALLOCATION / 4) as f32 / MAX_ALLOCATION as f32
+            + 10000.0 * (MAX_ALLOCATION / 2) as f32 / MAX_ALLOCATION as f32;
+        assert_eq!(state.categories.get("b").unwrap().surplus, surplus_b);
+    }
+
+    #[test]
+    fn rollover_flushes_balance_into_surplus_and_resets_spent() {
+        let account = account_with(
+            10000.0,
+            &[("a", MAX_ALLOCATION / 2), ("b", MAX_ALLOCATION / 4)],
+        );
+        let account = account.spend("a", 1000.0).unwrap();
+        let account = account.rollover(5000.0).unwrap();
+        let state = account.snapshot();
+        let budget_a = 10000.0 * (MAX_ALLOCATION / 2) as f32 / MAX_ALLOCATION as f32;
+        let budget_b = 10000.0 * (MAX_ALLOCATION / 4) as f32 / MAX_ALLOCATION as f32;
+        assert_eq!(
+            state.categories.get("a").unwrap().surplus,
+            budget_a - 1000.0
+        );
+        assert_eq!(state.categories.get("b").unwrap().surplus, budget_b);
+        assert_eq!(state.categories.get("a").unwrap().spent, 0.0);
+        assert_eq!(
+            state.balance,
+            5000.0 + (10000.0 - (budget_a - 1000.0 + budget_b))
+        );
+    }
+
+    #[test]
+    fn rollover_accumulates_existing_surplus() {
+        let account = account_with(10000.0, &[("a", MAX_ALLOCATION / 2)]);
+        let account = account.rollover(0.0).unwrap();
+        let account = account.spend("a", 2000.0).unwrap();
+        let account = account.rollover(0.0).unwrap();
+        let state = account.snapshot();
+        let first_budget = 10000.0 * (MAX_ALLOCATION / 2) as f32 / MAX_ALLOCATION as f32;
+        let second_budget =
+            (10000.0 - first_budget) * (MAX_ALLOCATION / 2) as f32 / MAX_ALLOCATION as f32;
+        let increment = second_budget - 2000.0;
+        assert_eq!(
+            state.categories.get("a").unwrap().surplus,
+            first_budget + increment
+        );
+        assert_eq!(state.categories.get("a").unwrap().spent, 0.0);
+        assert_eq!(state.balance, 10000.0 - first_budget - increment);
+    }
+
+    #[test]
+    fn rollover_cant_have_negative_income() {
+        let account = account_with(1000.0, &[]);
+        assert!(matches!(
+            account.rollover(-1.0),
+            Err(RolloverError::NegativeIncome)
+        ));
+    }
+
+    #[test]
+    fn consume_spent_settles_into_balance() {
+        let account = account_with(10000.0, &[("a", MAX_ALLOCATION / 4)]);
+        let account = account.spend("a", 1000.0).unwrap();
+        let account = account.consume_spent("a").unwrap();
+        let state = account.snapshot();
+        assert_eq!(state.balance, 9000.0);
+        assert_eq!(state.categories.get("a").unwrap().spent, 0.0);
+    }
+
+    #[test]
+    fn consume_spent_cant_overdraw_balance() {
+        let state = AccountState {
+            balance: 1000.0,
+            categories: HashMap::from([(
+                "a".to_string(),
+                CategoryState {
+                    allocation: MAX_ALLOCATION / 2,
+                    spent: 1500.0,
+                    surplus: 1000.0,
+                },
+            )]),
+        };
+        let account = Account::reconstitute(state).unwrap();
+        assert!(matches!(
+            account.consume_spent("a"),
+            Err(ConsumeSpentError::AccountInitialization(
+                AccountNewError::NegativeBalance
+            ))
+        ));
+    }
+
+    #[test]
+    fn consume_spent_category_not_found() {
+        let account = account_with(10000.0, &[("a", MAX_ALLOCATION / 4)]);
+        assert!(matches!(
+            account.consume_spent("savings"),
+            Err(ConsumeSpentError::CategoryNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn consume_surplus_returns_to_balance() {
+        let account = account_with(10000.0, &[("a", MAX_ALLOCATION / 2)]);
+        let account = account.rollover(0.0).unwrap();
+        let account = account.consume_surplus("a").unwrap();
+        let state = account.snapshot();
+        let surplus = 10000.0 * (MAX_ALLOCATION / 2) as f32 / MAX_ALLOCATION as f32;
+        assert_eq!(state.balance, 10000.0 - surplus + surplus);
+        assert_eq!(state.categories.get("a").unwrap().surplus, 0.0);
+    }
+
+    #[test]
+    fn consume_surplus_cant_reclaim_consumed_surplus() {
+        let state = AccountState {
+            balance: 1000.0,
+            categories: HashMap::from([(
+                "a".to_string(),
+                CategoryState {
+                    allocation: MAX_ALLOCATION / 2,
+                    spent: 1500.0,
+                    surplus: 1000.0,
+                },
+            )]),
+        };
+        let account = Account::reconstitute(state).unwrap();
+        assert!(matches!(
+            account.consume_surplus("a"),
+            Err(ConsumeSurplusError::AccountInitialization(
+                AccountNewError::SpendingExceedsAllocation(_, _, _, _)
+            ))
+        ));
+    }
+
+    #[test]
+    fn consume_surplus_category_not_found() {
+        let account = account_with(10000.0, &[("a", MAX_ALLOCATION / 4)]);
+        assert!(matches!(
+            account.consume_surplus("savings"),
+            Err(ConsumeSurplusError::CategoryNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn transfer_surplus_moves_entire_surplus() {
+        let account = account_with(
+            10000.0,
+            &[("a", MAX_ALLOCATION / 2), ("b", MAX_ALLOCATION / 4)],
+        );
+        let account = account.rollover(0.0).unwrap();
+        let account = account.transfer_surplus("a", "b").unwrap();
+        let state = account.snapshot();
+        let surplus_a = 10000.0 * (MAX_ALLOCATION / 2) as f32 / MAX_ALLOCATION as f32;
+        let surplus_b = 10000.0 * (MAX_ALLOCATION / 4) as f32 / MAX_ALLOCATION as f32;
+        assert_eq!(state.categories.get("a").unwrap().surplus, 0.0);
+        assert_eq!(
+            state.categories.get("b").unwrap().surplus,
+            surplus_a + surplus_b
+        );
+        assert_eq!(state.balance, 10000.0 - (surplus_a + surplus_b));
+    }
+
+    #[test]
+    fn transfer_surplus_same_category() {
+        let account = account_with(10000.0, &[("a", MAX_ALLOCATION / 4)]);
+        assert!(matches!(
+            account.transfer_surplus("a", "a"),
+            Err(TransferSurplusError::SameCategory(_))
+        ));
+    }
+
+    #[test]
+    fn transfer_surplus_source_not_found() {
+        let account = account_with(10000.0, &[("a", MAX_ALLOCATION / 4)]);
+        assert!(matches!(
+            account.transfer_surplus("savings", "a"),
+            Err(TransferSurplusError::SourceCategoryNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn transfer_surplus_target_not_found() {
+        let account = account_with(10000.0, &[("a", MAX_ALLOCATION / 4)]);
+        assert!(matches!(
+            account.transfer_surplus("a", "savings"),
+            Err(TransferSurplusError::TargetCategoryNotFound(_))
+        ));
     }
 
     #[test]
@@ -465,6 +710,22 @@ mod account_tests {
     }
 
     #[test]
+    fn reconstitute_spending_can_dip_into_surplus() {
+        let state = AccountState {
+            balance: 1000.0,
+            categories: HashMap::from([(
+                "test".to_string(),
+                CategoryState {
+                    allocation: MAX_ALLOCATION / 2,
+                    spent: 1500.0,
+                    surplus: 1000.0,
+                },
+            )]),
+        };
+        assert!(Account::reconstitute(state).is_ok());
+    }
+
+    #[test]
     fn reconstitute_spending_cant_exceed_allocation() {
         let state = AccountState {
             balance: 100.0,
@@ -473,13 +734,35 @@ mod account_tests {
                 CategoryState {
                     allocation: MAX_ALLOCATION / 2,
                     spent: 60.0,
+                    surplus: 0.0,
                 },
             )]),
         };
         assert!(matches!(
             Account::reconstitute(state),
             Err(AccountAggregateError::Account(
-                AccountNewError::SpendingExceedsAllocation(_, _, _)
+                AccountNewError::SpendingExceedsAllocation(_, _, _, _)
+            ))
+        ));
+    }
+
+    #[test]
+    fn reconstitute_spending_cant_exceed_allocation_and_surplus() {
+        let state = AccountState {
+            balance: 1000.0,
+            categories: HashMap::from([(
+                "test".to_string(),
+                CategoryState {
+                    allocation: MAX_ALLOCATION / 2,
+                    spent: 1500.01,
+                    surplus: 1000.0,
+                },
+            )]),
+        };
+        assert!(matches!(
+            Account::reconstitute(state),
+            Err(AccountAggregateError::Account(
+                AccountNewError::SpendingExceedsAllocation(_, _, _, _)
             ))
         ));
     }
@@ -493,6 +776,7 @@ mod account_tests {
                 CategoryState {
                     allocation: MAX_ALLOCATION + 1,
                     spent: 0.0,
+                    surplus: 0.0,
                 },
             )]),
         };
@@ -515,6 +799,7 @@ mod account_tests {
                     CategoryState {
                         allocation,
                         spent: 0.0,
+                        surplus: 0.0,
                     },
                 ),
                 (
@@ -522,6 +807,7 @@ mod account_tests {
                     CategoryState {
                         allocation,
                         spent: 0.0,
+                        surplus: 0.0,
                     },
                 ),
             ]),
@@ -542,6 +828,8 @@ mod account_tests {
             &[("a", MAX_ALLOCATION / 2), ("b", MAX_ALLOCATION / 4)],
         );
         let account = account.spend("a", 1000.0).unwrap();
+        let account = account.rollover(5000.0).unwrap();
+        let account = account.spend("a", 6000.0).unwrap();
         let state = account.snapshot();
         let reconstituted = Account::reconstitute(state.clone()).unwrap();
         assert_eq!(reconstituted.snapshot(), state);
@@ -650,13 +938,19 @@ mod spending_tests {
 
     #[test]
     fn new_cant_exceed_max_allocation() {
-        let result = Spending::new(MAX_ALLOCATION + 1, 0.0);
+        let result = Spending::new(MAX_ALLOCATION + 1, 0.0, 0.0);
         assert!(matches!(result, Err(SpendingNewError::AllocationLimit(_))));
     }
 
     #[test]
     fn new_cant_have_negative_spending() {
-        let result = Spending::new(MAX_ALLOCATION, -1.0);
+        let result = Spending::new(MAX_ALLOCATION, -1.0, 0.0);
         assert!(matches!(result, Err(SpendingNewError::NegativeSpending(_))));
+    }
+
+    #[test]
+    fn new_cant_have_negative_surplus() {
+        let result = Spending::new(MAX_ALLOCATION, 0.0, -1.0);
+        assert!(matches!(result, Err(SpendingNewError::NegativeSurplus(_))));
     }
 }
