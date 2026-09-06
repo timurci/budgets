@@ -69,7 +69,9 @@ fragments, so no candidate state ever needs to be constructed.
   `check_spending_within_budget(name, balance, allocation, surplus, spending.spent)`
   The wrong call judges the current state, which is already valid — the
   check would always pass and `spend` could push a category over its
-  budget. Likewise `remove_funds` passes `self.balance - amount`; passing
+  budget. Likewise `remove_funds` passes `(self.balance, amount)`:
+  subtraction panics on underflow (and silently wraps in release), so the
+  check performs `safe_sub` internally and judges the result — passing
   `self.balance` would validate the past, not the future.
 - **Collection rules own their reduction.** When a rule is about a whole
   collection (total allocations ≤ MAX), the check receives the items and
@@ -99,15 +101,17 @@ fragments, so no candidate state ever needs to be constructed.
   mirror like `spend`'s `spent + amount` may stay inline: it is a single
   expression that visibly corresponds to `apply`'s `spent += amount`.
 - **Overflow safety belongs to the check, not the caller.** A check never
-  forces a command to widen a value. Either its parameters already span the
-  whole domain range (f32 amounts and balances — nothing to widen, so
-  `spend` passes `spending.spent + amount` as-is), or the check folds
-  narrow items and widens inside the fold (`check_total_allocations`
-  receives u8 allocations and accumulates in u32). A command upcasting to
-  satisfy a signature is glue — see the collection rule. Reductions
-  accumulate into types whose overflow is out of the question for this
-  application (u32 for counts); leaf values keep their natural narrow
-  types.
+  forces a command to widen a value. Either the operation is infallible in
+  practice (addition of `Decimal` amounts cannot underflow and cannot
+  realistically overflow, so `spend` passes `spending.spent + amount`
+  as-is), or the check performs the fallible arithmetic itself with
+  checked operations (`check_negative_balance` receives balance and
+  deduction and judges the prospective balance via `safe_sub` internally;
+  `check_total_allocations` receives u8 allocations and accumulates in
+  u32). A command upcasting to satisfy a signature is glue — see the
+  collection rule. Reductions accumulate into types whose overflow is out
+  of the question for this application (u32 for counts); leaf values keep
+  their natural narrow types.
 - **Preconditions are the mirror image.** They ask whether the command
   makes sense *now*: their state parameters are current values
   (`check_category_exists(name, categories)` looks at the map as it is),
