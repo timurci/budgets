@@ -10,10 +10,22 @@ fn budget(balance: Decimal, allocation: u8) -> Decimal {
     balance * allocation / MAX_ALLOCATION
 }
 
+fn total_budget(balance: Decimal, categories: &HashMap<String, Spending>) -> Decimal {
+    categories
+        .values()
+        .map(|spending| budget(balance, spending.allocation))
+        .sum()
+}
+
+fn removal_balance(balance: Decimal, surplus: Decimal, spent: Decimal) -> Decimal {
+    (balance + surplus) - spent
+}
+
 #[derive(Clone, Debug)]
 pub struct Account {
     balance: Decimal,
     categories: HashMap<String, Spending>,
+    debts: HashMap<String, Decimal>,
     events: Vec<AccountEvent>,
 }
 
@@ -28,6 +40,7 @@ struct Spending {
 pub struct AccountState {
     pub balance: Decimal,
     pub categories: HashMap<String, CategoryState>,
+    pub debts: HashMap<String, Decimal>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -39,16 +52,42 @@ pub struct CategoryState {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum AccountEvent {
-    CategoryAdded { name: String, allocation: u8 },
-    CategoryRemoved { name: String },
-    RolledOver { income: Decimal },
-    Spent { category: String, amount: Decimal },
-    SpentConsumed { category: String },
-    SurplusConsumed { category: String },
-    SurplusTransferred { from: String, to: String },
-    FundsAdded { amount: Decimal },
-    FundsRemoved { amount: Decimal },
-    CategoriesReallocated { allocations: HashMap<String, u8> },
+    CategoryAdded {
+        name: String,
+        allocation: u8,
+    },
+    CategoryRemoved {
+        name: String,
+    },
+    RolledOver {
+        income: Decimal,
+    },
+    Spent {
+        category: String,
+        amount: Decimal,
+    },
+    SurplusTransferred {
+        from: String,
+        to: String,
+    },
+    FundsAdded {
+        amount: Decimal,
+    },
+    FundsRemoved {
+        amount: Decimal,
+    },
+    CategoriesReallocated {
+        allocations: HashMap<String, u8>,
+    },
+    DebtAdded {
+        name: String,
+        amount: Decimal,
+    },
+    DebtRepaid {
+        category: String,
+        debt: String,
+        amount: Decimal,
+    },
 }
 
 impl Account {
@@ -71,7 +110,15 @@ impl Account {
     pub fn remove_category(&mut self, name: &str) -> Result<(), AccountError> {
         preconditions::check_category_exists(name, &self.categories)?;
         let spending = self.categories.get(name).expect("existence checked");
-        preconditions::check_category_idle(name, spending)?;
+        let funded = self.balance + spending.surplus;
+        invariants::check_negative_balance(funded, spending.spent)?;
+        let balance = removal_balance(self.balance, spending.surplus, spending.spent);
+        invariants::check_all_spending_within_budget(
+            balance,
+            self.categories
+                .iter()
+                .filter(|(existing, _)| existing.as_str() != name),
+        )?;
         self.emit(AccountEvent::CategoryRemoved {
             name: name.to_string(),
         });
@@ -79,12 +126,7 @@ impl Account {
     }
 
     pub fn rollover(&mut self, income: Decimal) -> Result<(), AccountError> {
-        let mut total_budget = Decimal::ZERO;
-        let mut total_spent = Decimal::ZERO;
         for spending in self.categories.values() {
-            let current = budget(self.balance, spending.allocation);
-            total_budget += current;
-            total_spent += spending.spent;
             invariants::check_negative_surplus(
                 self.balance,
                 spending.allocation,
@@ -92,7 +134,10 @@ impl Account {
                 spending.spent,
             )?;
         }
-        invariants::check_negative_balance(income + self.balance + total_spent, total_budget)?;
+        invariants::check_negative_balance(
+            income + self.balance,
+            total_budget(self.balance, &self.categories),
+        )?;
         self.emit(AccountEvent::RolledOver { income });
         Ok(())
     }
@@ -110,43 +155,6 @@ impl Account {
         self.emit(AccountEvent::Spent {
             category: category.to_string(),
             amount,
-        });
-        Ok(())
-    }
-
-    pub fn consume_spent(&mut self, category: &str) -> Result<(), AccountError> {
-        preconditions::check_category_exists(category, &self.categories)?;
-        let spent = self
-            .categories
-            .get(category)
-            .expect("existence checked")
-            .spent;
-        invariants::check_negative_balance(self.balance, spent)?;
-        let balance = self.balance - spent;
-        invariants::check_all_spending_within_budget(
-            balance,
-            self.categories
-                .iter()
-                .filter(|(name, _)| name.as_str() != category),
-        )?;
-        self.emit(AccountEvent::SpentConsumed {
-            category: category.to_string(),
-        });
-        Ok(())
-    }
-
-    pub fn consume_surplus(&mut self, category: &str) -> Result<(), AccountError> {
-        preconditions::check_category_exists(category, &self.categories)?;
-        let spending = self.categories.get(category).expect("existence checked");
-        invariants::check_spending_within_budget(
-            category,
-            self.balance + spending.surplus,
-            spending.allocation,
-            Decimal::ZERO,
-            spending.spent,
-        )?;
-        self.emit(AccountEvent::SurplusConsumed {
-            category: category.to_string(),
         });
         Ok(())
     }
@@ -204,6 +212,41 @@ impl Account {
         Ok(())
     }
 
+    pub fn add_debt(&mut self, name: &str, amount: Decimal) -> Result<(), AccountError> {
+        preconditions::check_debt_absent(name, &self.debts)?;
+        self.emit(AccountEvent::DebtAdded {
+            name: name.to_string(),
+            amount,
+        });
+        Ok(())
+    }
+
+    pub fn repay_debt(
+        &mut self,
+        category: &str,
+        debt: &str,
+        amount: Decimal,
+    ) -> Result<(), AccountError> {
+        preconditions::check_category_exists(category, &self.categories)?;
+        preconditions::check_debt_exists(debt, &self.debts)?;
+        let owed = self.debts.get(debt).expect("debt existence checked");
+        invariants::check_debt_within_owed(debt, *owed, amount)?;
+        let spending = self.categories.get(category).expect("existence checked");
+        invariants::check_spending_within_budget(
+            category,
+            self.balance,
+            spending.allocation,
+            spending.surplus,
+            spending.spent + amount,
+        )?;
+        self.emit(AccountEvent::DebtRepaid {
+            category: category.to_string(),
+            debt: debt.to_string(),
+            amount,
+        });
+        Ok(())
+    }
+
     pub fn snapshot(&self) -> AccountState {
         AccountState {
             balance: self.balance,
@@ -221,6 +264,7 @@ impl Account {
                     )
                 })
                 .collect(),
+            debts: self.debts.clone(),
         }
     }
 
@@ -241,6 +285,7 @@ impl Account {
                     )
                 })
                 .collect(),
+            debts: snapshot.debts,
             events: Vec::new(),
         };
         if let Some(events) = events {
@@ -264,38 +309,24 @@ impl Account {
                 );
             }
             AccountEvent::CategoryRemoved { name } => {
-                self.categories.remove(name);
+                let spending = self.categories.remove(name).expect("validated event");
+                self.balance = removal_balance(self.balance, spending.surplus, spending.spent);
             }
             AccountEvent::RolledOver { income } => {
                 let balance = self.balance;
-                let mut total_budget = Decimal::ZERO;
-                let mut total_spent = Decimal::ZERO;
+                let flushed = total_budget(balance, &self.categories);
                 for spending in self.categories.values_mut() {
                     let current = budget(balance, spending.allocation);
-                    total_budget += current;
-                    total_spent += spending.spent;
                     spending.surplus = spending.surplus + current - spending.spent;
                     spending.spent = Decimal::ZERO;
                 }
-                self.balance = *income + ((balance + total_spent) - total_budget);
+                self.balance = *income + (balance - flushed);
             }
             AccountEvent::Spent { category, amount } => {
                 self.categories
                     .get_mut(category)
                     .expect("validated event")
                     .spent += *amount;
-            }
-            AccountEvent::SpentConsumed { category } => {
-                let spending = self.categories.get_mut(category).expect("validated event");
-                let spent = spending.spent;
-                spending.spent = Decimal::ZERO;
-                self.balance -= spent;
-            }
-            AccountEvent::SurplusConsumed { category } => {
-                let spending = self.categories.get_mut(category).expect("validated event");
-                let surplus = spending.surplus;
-                spending.surplus = Decimal::ZERO;
-                self.balance += surplus;
             }
             AccountEvent::SurplusTransferred { from, to } => {
                 let surplus = self.categories.get(from).expect("validated event").surplus;
@@ -322,6 +353,30 @@ impl Account {
                         .allocation = *allocation;
                 }
             }
+            AccountEvent::DebtAdded { name, amount } => {
+                self.debts.insert(name.clone(), *amount);
+            }
+            AccountEvent::DebtRepaid {
+                category,
+                debt,
+                amount,
+            } => {
+                self.categories
+                    .get_mut(category)
+                    .expect("validated event")
+                    .spent += *amount;
+                let remaining = self
+                    .debts
+                    .get(debt)
+                    .expect("validated event")
+                    .safe_sub(*amount)
+                    .expect("validated event");
+                if remaining.is_zero() {
+                    self.debts.remove(debt);
+                } else {
+                    self.debts.insert(debt.clone(), remaining);
+                }
+            }
         }
     }
 
@@ -336,6 +391,7 @@ impl Default for Account {
         Self {
             balance: Decimal::ZERO,
             categories: HashMap::new(),
+            debts: HashMap::new(),
             events: Vec::new(),
         }
     }
@@ -434,12 +490,27 @@ mod invariants {
         }
         Ok(())
     }
+
+    pub(super) fn check_debt_within_owed(
+        name: &str,
+        owed: Decimal,
+        amount: Decimal,
+    ) -> Result<(), AccountInvariantError> {
+        if owed.safe_sub(amount).is_err() {
+            return Err(AccountInvariantError::DebtOverpayment(
+                name.to_string(),
+                owed,
+                amount,
+            ));
+        }
+        Ok(())
+    }
 }
 
 mod preconditions {
     use std::collections::HashMap;
 
-    use super::{AccountPreconditionError, Spending};
+    use super::{AccountPreconditionError, Decimal, Spending};
 
     pub(super) fn check_category_exists(
         name: &str,
@@ -457,23 +528,6 @@ mod preconditions {
     ) -> Result<(), AccountPreconditionError> {
         if categories.contains_key(name) {
             return Err(AccountPreconditionError::DuplicateCategory(
-                name.to_string(),
-            ));
-        }
-        Ok(())
-    }
-
-    pub(super) fn check_category_idle(
-        name: &str,
-        spending: &Spending,
-    ) -> Result<(), AccountPreconditionError> {
-        if !spending.spent.is_zero() {
-            return Err(AccountPreconditionError::CategoryHasSpending(
-                name.to_string(),
-            ));
-        }
-        if !spending.surplus.is_zero() {
-            return Err(AccountPreconditionError::CategoryHasSurplus(
                 name.to_string(),
             ));
         }
@@ -525,6 +579,26 @@ mod preconditions {
         }
         Ok(())
     }
+
+    pub(super) fn check_debt_absent(
+        name: &str,
+        debts: &HashMap<String, Decimal>,
+    ) -> Result<(), AccountPreconditionError> {
+        if debts.contains_key(name) {
+            return Err(AccountPreconditionError::DuplicateDebt(name.to_string()));
+        }
+        Ok(())
+    }
+
+    pub(super) fn check_debt_exists(
+        name: &str,
+        debts: &HashMap<String, Decimal>,
+    ) -> Result<(), AccountPreconditionError> {
+        if !debts.contains_key(name) {
+            return Err(AccountPreconditionError::DebtNotFound(name.to_string()));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Error, Debug)]
@@ -544,12 +618,6 @@ pub enum AccountPreconditionError {
     #[error("duplicate category: {0}")]
     DuplicateCategory(String),
 
-    #[error("category {0} still has spending")]
-    CategoryHasSpending(String),
-
-    #[error("category {0} still has surplus")]
-    CategoryHasSurplus(String),
-
     #[error("transfer source and target are the same: {0}")]
     SameCategory(String),
 
@@ -561,6 +629,12 @@ pub enum AccountPreconditionError {
 
     #[error("requested list of categories do not match existing ones")]
     UnmatchedCategories,
+
+    #[error("duplicate debt: {0}")]
+    DuplicateDebt(String),
+
+    #[error("debt {0} does not exist")]
+    DebtNotFound(String),
 }
 
 #[derive(Error, Debug)]
@@ -579,6 +653,9 @@ pub enum AccountInvariantError {
 
     #[error("surplus would be negative")]
     NegativeSurplus,
+
+    #[error("debt {0} repayment ({2}) exceeds owed ({1})")]
+    DebtOverpayment(String, Decimal, Decimal),
 }
 
 #[cfg(test)]
@@ -600,6 +677,7 @@ mod account_tests {
         let state = Account::default().snapshot();
         assert_eq!(state.balance, Decimal::ZERO);
         assert!(state.categories.is_empty());
+        assert!(state.debts.is_empty());
     }
 
     #[test]
@@ -662,8 +740,35 @@ mod account_tests {
         assert_eq!(state.categories.get("a").unwrap().spent, Decimal::ZERO);
         assert_eq!(
             state.balance,
-            Decimal::from(5000u64)
-                + (Decimal::from(10000u64) - (budget_a - Decimal::from(1000u64) + budget_b))
+            Decimal::from(5000u64) + (Decimal::from(10000u64) - (budget_a + budget_b))
+        );
+    }
+
+    #[test]
+    fn rollover_with_full_allocation_leaves_only_income() {
+        let mut account = account_with(
+            Decimal::from(10000u64),
+            &[("a", MAX_ALLOCATION / 2), ("b", MAX_ALLOCATION / 2)],
+        );
+        account.rollover(Decimal::from(2000u64)).unwrap();
+        let state = account.snapshot();
+        assert_eq!(state.balance, Decimal::from(2000u64));
+    }
+
+    #[test]
+    fn rollover_expenses_spent_from_total() {
+        let mut account = account_with(Decimal::from(10000u64), &[("a", MAX_ALLOCATION / 2)]);
+        account.spend("a", Decimal::from(1000u64)).unwrap();
+        account.rollover(Decimal::from(5000u64)).unwrap();
+        let state = account.snapshot();
+        let budget_a = Decimal::from(10000u64) * (MAX_ALLOCATION / 2) / MAX_ALLOCATION;
+        assert_eq!(
+            state.balance,
+            Decimal::from(5000u64) + (Decimal::from(10000u64) - budget_a)
+        );
+        assert_eq!(
+            state.categories.get("a").unwrap().surplus,
+            budget_a - Decimal::from(1000u64)
         );
     }
 
@@ -685,29 +790,61 @@ mod account_tests {
         assert_eq!(state.categories.get("a").unwrap().spent, Decimal::ZERO);
         assert_eq!(
             state.balance,
-            Decimal::from(10000u64) - first_budget - increment
+            (Decimal::from(10000u64) - first_budget) - second_budget
         );
     }
 
     #[test]
-    fn consume_spent_settles_into_balance() {
+    fn remove_category_settles_spent_into_balance() {
         let mut account = account_with(Decimal::from(10000u64), &[("a", MAX_ALLOCATION / 4)]);
         account.spend("a", Decimal::from(1000u64)).unwrap();
-        account.consume_spent("a").unwrap();
+        account.remove_category("a").unwrap();
         let state = account.snapshot();
         assert_eq!(state.balance, Decimal::from(9000u64));
-        assert_eq!(state.categories.get("a").unwrap().spent, Decimal::ZERO);
+        assert!(!state.categories.contains_key("a"));
     }
 
     #[test]
-    fn consume_surplus_returns_to_balance() {
+    fn remove_category_fails_when_sibling_exceeds_shrunken_budget() {
+        let mut account = account_with(
+            Decimal::from(10000u64),
+            &[("a", MAX_ALLOCATION / 2), ("b", MAX_ALLOCATION / 2)],
+        );
+        let full_budget = Decimal::from(10000u64) * (MAX_ALLOCATION / 2) / MAX_ALLOCATION;
+        account.spend("a", full_budget).unwrap();
+        account.spend("b", full_budget).unwrap();
+        let result = account.remove_category("a");
+        assert!(matches!(
+            result,
+            Err(AccountError::Invariant(
+                AccountInvariantError::SpendingExceedsAllocation(name, _, _, _)
+            )) if name == "b"
+        ));
+    }
+
+    #[test]
+    fn remove_category_returns_surplus_to_balance() {
         let mut account = account_with(Decimal::from(10000u64), &[("a", MAX_ALLOCATION / 2)]);
         account.rollover(Decimal::ZERO).unwrap();
-        account.consume_surplus("a").unwrap();
+        account.remove_category("a").unwrap();
         let state = account.snapshot();
-        let surplus = Decimal::from(10000u64) * (MAX_ALLOCATION / 2) / MAX_ALLOCATION;
-        assert_eq!(state.balance, Decimal::from(10000u64) - surplus + surplus);
-        assert_eq!(state.categories.get("a").unwrap().surplus, Decimal::ZERO);
+        assert_eq!(state.balance, Decimal::from(10000u64));
+        assert!(!state.categories.contains_key("a"));
+    }
+
+    #[test]
+    fn remove_category_settles_surplus_minus_spent() {
+        let mut account = account_with(
+            Decimal::from(10000u64),
+            &[("a", MAX_ALLOCATION / 2), ("b", MAX_ALLOCATION / 2)],
+        );
+        account.rollover(Decimal::ZERO).unwrap();
+        account.spend("a", Decimal::from(1000u64)).unwrap();
+        account.remove_category("a").unwrap();
+        let state = account.snapshot();
+        let surplus_a = Decimal::from(10000u64) * (MAX_ALLOCATION / 2) / MAX_ALLOCATION;
+        assert_eq!(state.balance, surplus_a - Decimal::from(1000u64));
+        assert!(!state.categories.contains_key("a"));
     }
 
     #[test]
@@ -815,6 +952,85 @@ mod account_tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn add_debt_tracks_owed() {
+        let mut account = account_with(Decimal::from(1000u64), &[]);
+        account.add_debt("loan", Decimal::from(400u64)).unwrap();
+        let state = account.snapshot();
+        assert_eq!(state.debts.get("loan"), Some(&Decimal::from(400u64)));
+    }
+
+    #[test]
+    fn repay_debt_adds_on_top_of_spent() {
+        let mut account = account_with(Decimal::from(10000u64), &[("a", MAX_ALLOCATION / 2)]);
+        account.add_debt("loan", Decimal::from(1000u64)).unwrap();
+        account.spend("a", Decimal::from(1000u64)).unwrap();
+        account
+            .repay_debt("a", "loan", Decimal::from(400u64))
+            .unwrap();
+        let state = account.snapshot();
+        assert_eq!(
+            state.categories.get("a").unwrap().spent,
+            Decimal::from(1400u64)
+        );
+        assert_eq!(state.debts.get("loan"), Some(&Decimal::from(600u64)));
+        assert_eq!(state.balance, Decimal::from(10000u64));
+    }
+
+    #[test]
+    fn repay_debt_in_full_removes_entry() {
+        let mut account = account_with(Decimal::from(10000u64), &[("a", MAX_ALLOCATION / 2)]);
+        account.add_debt("loan", Decimal::from(400u64)).unwrap();
+        account
+            .repay_debt("a", "loan", Decimal::from(400u64))
+            .unwrap();
+        let state = account.snapshot();
+        assert!(!state.debts.contains_key("loan"));
+        assert_eq!(
+            state.categories.get("a").unwrap().spent,
+            Decimal::from(400u64)
+        );
+    }
+
+    #[test]
+    fn debt_snapshot_reconstitute_roundtrip() {
+        let mut account = account_with(Decimal::from(10000u64), &[("a", MAX_ALLOCATION / 2)]);
+        account.add_debt("loan", Decimal::from(1000u64)).unwrap();
+        account
+            .repay_debt("a", "loan", Decimal::from(400u64))
+            .unwrap();
+        let state = account.snapshot();
+        let reconstituted = Account::reconstitute(state.clone(), None);
+        assert_eq!(reconstituted.snapshot(), state);
+    }
+
+    #[test]
+    fn reconstitute_replays_debt_events() {
+        let mut account = account_with(Decimal::from(10000u64), &[("a", MAX_ALLOCATION / 2)]);
+        let base = account.snapshot();
+        account.add_debt("loan", Decimal::from(1000u64)).unwrap();
+        account
+            .repay_debt("a", "loan", Decimal::from(400u64))
+            .unwrap();
+        let final_state = account.snapshot();
+
+        let replayed = Account::reconstitute(
+            base,
+            Some(vec![
+                AccountEvent::DebtAdded {
+                    name: "loan".to_string(),
+                    amount: Decimal::from(1000u64),
+                },
+                AccountEvent::DebtRepaid {
+                    category: "a".to_string(),
+                    debt: "loan".to_string(),
+                    amount: Decimal::from(400u64),
+                },
+            ]),
+        );
+        assert_eq!(replayed.snapshot(), final_state);
     }
 }
 
@@ -989,6 +1205,42 @@ mod invariants_tests {
             Err(AccountInvariantError::NegativeSurplus)
         ));
     }
+
+    #[test]
+    fn debt_repayment_within_owed_passes() {
+        assert!(
+            invariants::check_debt_within_owed(
+                "loan",
+                Decimal::from(1000u64),
+                Decimal::from(400u64)
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn debt_repayment_exactly_owed_passes() {
+        assert!(
+            invariants::check_debt_within_owed(
+                "loan",
+                Decimal::from(1000u64),
+                Decimal::from(1000u64)
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn debt_repayment_exceeding_owed_fails() {
+        assert!(matches!(
+            invariants::check_debt_within_owed(
+                "loan",
+                Decimal::from(1000u64),
+                Decimal::from(1000u64) + Decimal::new(1),
+            ),
+            Err(AccountInvariantError::DebtOverpayment(name, _, _)) if name == "loan"
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -1040,42 +1292,6 @@ mod preconditions_tests {
     fn absent_category_passes() {
         let categories = categories(&["a"]);
         assert!(preconditions::check_category_absent("b", &categories).is_ok());
-    }
-
-    #[test]
-    fn category_with_spending_fails() {
-        let spending = Spending {
-            allocation: 10,
-            spent: Decimal::from(1u64),
-            surplus: Decimal::ZERO,
-        };
-        assert!(matches!(
-            preconditions::check_category_idle("a", &spending),
-            Err(AccountPreconditionError::CategoryHasSpending(name)) if name == "a"
-        ));
-    }
-
-    #[test]
-    fn category_with_surplus_fails() {
-        let spending = Spending {
-            allocation: 10,
-            spent: Decimal::ZERO,
-            surplus: Decimal::from(1u64),
-        };
-        assert!(matches!(
-            preconditions::check_category_idle("a", &spending),
-            Err(AccountPreconditionError::CategoryHasSurplus(name)) if name == "a"
-        ));
-    }
-
-    #[test]
-    fn idle_category_passes() {
-        let spending = Spending {
-            allocation: 10,
-            spent: Decimal::ZERO,
-            surplus: Decimal::ZERO,
-        };
-        assert!(preconditions::check_category_idle("a", &spending).is_ok());
     }
 
     #[test]
@@ -1134,6 +1350,43 @@ mod preconditions_tests {
         let categories = categories(&["a", "b"]);
         let allocations = HashMap::from([("a".to_string(), 10), ("b".to_string(), 20)]);
         assert!(preconditions::check_categories_match(&categories, &allocations).is_ok());
+    }
+
+    fn debts(names: &[(&str, u64)]) -> HashMap<String, Decimal> {
+        names
+            .iter()
+            .map(|(name, amount)| (name.to_string(), Decimal::from(*amount)))
+            .collect()
+    }
+
+    #[test]
+    fn duplicate_debt_fails() {
+        let debts = debts(&[("loan", 100)]);
+        assert!(matches!(
+            preconditions::check_debt_absent("loan", &debts),
+            Err(AccountPreconditionError::DuplicateDebt(name)) if name == "loan"
+        ));
+    }
+
+    #[test]
+    fn absent_debt_passes() {
+        let debts = debts(&[("loan", 100)]);
+        assert!(preconditions::check_debt_absent("other", &debts).is_ok());
+    }
+
+    #[test]
+    fn missing_debt_fails() {
+        let debts = debts(&[("loan", 100)]);
+        assert!(matches!(
+            preconditions::check_debt_exists("other", &debts),
+            Err(AccountPreconditionError::DebtNotFound(name)) if name == "other"
+        ));
+    }
+
+    #[test]
+    fn existing_debt_passes() {
+        let debts = debts(&[("loan", 100)]);
+        assert!(preconditions::check_debt_exists("loan", &debts).is_ok());
     }
 }
 

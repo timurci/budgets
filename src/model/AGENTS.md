@@ -53,7 +53,7 @@ fragments, so no candidate state ever needs to be constructed.
   (`check_spending_within_budget`: a category's spending may not exceed its
   budget plus surplus), not after a command that happens to trigger it
   (`check_spend_amount`). One rule serves many commands: `spend`,
-  `consume_surplus`, `transfer_surplus` and `reallocate_categories` all
+  `transfer_surplus`, `reallocate_categories` and `repay_debt` all
   call `check_spending_within_budget` with different arguments.
 - **Judged values vs. reported values.** Some parameters decide pass/fail;
   others exist only so the error can name the offender (`name: &str` in
@@ -89,10 +89,11 @@ fragments, so no candidate state ever needs to be constructed.
 - **A rule exists once.** `check_all_spending_within_budget` is a loop that
   delegates to `check_spending_within_budget` — the comparison lives in one
   place. A command passes only the entities whose prospective values need
-  judging: `consume_spent` omits the consumed category because its
-  prospective spent is 0, which always fits its budget — its *current*
-  spent, judged against the shrunken post-command budget, would fail
-  spuriously (spent 900, surplus 400, budget halved from 500 to 50).
+  judging: `remove_category` omits the removed category because it no longer
+  exists in the prospective state — its spent is settled into the balance by
+  the removal math, so its *current* spent, judged against the shrunken
+  post-command budget, would fail spuriously (spent 900, surplus 400, the
+  balance shrunk by the 900 already paid out).
 - **Non-trivial derivation is shared with `apply` — or it is a single
   expression.** Validation must never compute a value that `apply` also
   computes independently; the two would drift and the command would
