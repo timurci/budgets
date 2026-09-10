@@ -2,7 +2,10 @@ use std::collections::HashMap;
 
 use thiserror::Error;
 
-use crate::types::Decimal;
+use crate::types::id::id_type;
+use crate::types::{Decimal, DecimalError};
+
+id_type!(AccountId, CategoryId, DebtId);
 
 const MAX_ALLOCATION: u8 = 200;
 
@@ -10,7 +13,19 @@ fn budget(balance: Decimal, allocation: u8) -> Decimal {
     balance * allocation / MAX_ALLOCATION
 }
 
-fn total_budget(balance: Decimal, categories: &HashMap<String, Spending>) -> Decimal {
+fn available_surplus(
+    balance: Decimal,
+    allocation: u8,
+    surplus: Decimal,
+    spent: Decimal,
+) -> Result<Decimal, DecimalError> {
+    let overspent = spent
+        .safe_sub(budget(balance, allocation))
+        .unwrap_or(Decimal::ZERO);
+    surplus.safe_sub(overspent)
+}
+
+fn total_budget(balance: Decimal, categories: &HashMap<CategoryId, Spending>) -> Decimal {
     categories
         .values()
         .map(|spending| budget(balance, spending.allocation))
@@ -23,9 +38,10 @@ fn removal_balance(balance: Decimal, surplus: Decimal, spent: Decimal) -> Decima
 
 #[derive(Clone, Debug)]
 pub struct Account {
+    id: AccountId,
     balance: Decimal,
-    categories: HashMap<String, Spending>,
-    debts: HashMap<String, Decimal>,
+    categories: HashMap<CategoryId, Spending>,
+    debts: HashMap<DebtId, Decimal>,
     events: Vec<AccountEvent>,
 }
 
@@ -38,9 +54,21 @@ struct Spending {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AccountState {
+    pub id: AccountId,
     pub balance: Decimal,
-    pub categories: HashMap<String, CategoryState>,
-    pub debts: HashMap<String, Decimal>,
+    pub categories: HashMap<CategoryId, CategoryState>,
+    pub debts: HashMap<DebtId, Decimal>,
+}
+
+impl AccountState {
+    pub fn empty(id: AccountId) -> Self {
+        Self {
+            id,
+            balance: Decimal::ZERO,
+            categories: HashMap::new(),
+            debts: HashMap::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -53,22 +81,23 @@ pub struct CategoryState {
 #[derive(Clone, Debug, PartialEq)]
 pub enum AccountEvent {
     CategoryAdded {
-        name: String,
+        id: CategoryId,
         allocation: u8,
     },
     CategoryRemoved {
-        name: String,
+        id: CategoryId,
     },
     RolledOver {
         income: Decimal,
     },
     Spent {
-        category: String,
+        category: CategoryId,
         amount: Decimal,
     },
     SurplusTransferred {
-        from: String,
-        to: String,
+        from: CategoryId,
+        to: CategoryId,
+        amount: Decimal,
     },
     FundsAdded {
         amount: Decimal,
@@ -77,22 +106,33 @@ pub enum AccountEvent {
         amount: Decimal,
     },
     CategoriesReallocated {
-        allocations: HashMap<String, u8>,
+        allocations: HashMap<CategoryId, u8>,
     },
     DebtAdded {
-        name: String,
+        id: DebtId,
         amount: Decimal,
     },
     DebtRepaid {
-        category: String,
-        debt: String,
+        category: CategoryId,
+        debt: DebtId,
         amount: Decimal,
     },
 }
 
 impl Account {
-    pub fn add_category(&mut self, name: &str, allocation: u8) -> Result<(), AccountError> {
-        preconditions::check_category_absent(name, &self.categories)?;
+    pub fn id(&self) -> &AccountId {
+        &self.id
+    }
+
+    pub fn events(&self) -> &[AccountEvent] {
+        &self.events
+    }
+
+    pub fn mark_committed(&mut self) {
+        self.events.clear();
+    }
+
+    pub fn add_category(&mut self, allocation: u8) -> Result<CategoryId, AccountError> {
         Spending::new(allocation, Decimal::ZERO, Decimal::ZERO)?;
         invariants::check_total_allocations(
             self.categories
@@ -100,16 +140,14 @@ impl Account {
                 .map(|spending| spending.allocation)
                 .chain(std::iter::once(allocation)),
         )?;
-        self.emit(AccountEvent::CategoryAdded {
-            name: name.to_string(),
-            allocation,
-        });
-        Ok(())
+        let id = CategoryId::new_v7();
+        self.emit(AccountEvent::CategoryAdded { id, allocation });
+        Ok(id)
     }
 
-    pub fn remove_category(&mut self, name: &str) -> Result<(), AccountError> {
-        preconditions::check_category_exists(name, &self.categories)?;
-        let spending = self.categories.get(name).expect("existence checked");
+    pub fn remove_category(&mut self, id: &CategoryId) -> Result<(), AccountError> {
+        preconditions::check_category_exists(id, &self.categories)?;
+        let spending = self.categories.get(id).expect("existence checked");
         let funded = self.balance + spending.surplus;
         invariants::check_negative_balance(funded, spending.spent)?;
         let balance = removal_balance(self.balance, spending.surplus, spending.spent);
@@ -117,11 +155,9 @@ impl Account {
             balance,
             self.categories
                 .iter()
-                .filter(|(existing, _)| existing.as_str() != name),
+                .filter(|(existing, _)| *existing != id),
         )?;
-        self.emit(AccountEvent::CategoryRemoved {
-            name: name.to_string(),
-        });
+        self.emit(AccountEvent::CategoryRemoved { id: *id });
         Ok(())
     }
 
@@ -142,7 +178,7 @@ impl Account {
         Ok(())
     }
 
-    pub fn spend(&mut self, category: &str, amount: Decimal) -> Result<(), AccountError> {
+    pub fn spend(&mut self, category: &CategoryId, amount: Decimal) -> Result<(), AccountError> {
         preconditions::check_category_exists(category, &self.categories)?;
         let spending = self.categories.get(category).expect("existence checked");
         invariants::check_spending_within_budget(
@@ -153,27 +189,34 @@ impl Account {
             spending.spent + amount,
         )?;
         self.emit(AccountEvent::Spent {
-            category: category.to_string(),
+            category: *category,
             amount,
         });
         Ok(())
     }
 
-    pub fn transfer_surplus(&mut self, from: &str, to: &str) -> Result<(), AccountError> {
+    pub fn transfer_surplus(
+        &mut self,
+        from: &CategoryId,
+        to: &CategoryId,
+        amount: Decimal,
+    ) -> Result<(), AccountError> {
         preconditions::check_distinct_source_target(from, to)?;
         preconditions::check_source_exists(from, &self.categories)?;
         preconditions::check_target_exists(to, &self.categories)?;
         let source = self.categories.get(from).expect("source checked");
-        invariants::check_spending_within_budget(
+        invariants::check_transfer_within_surplus(
             from,
             self.balance,
             source.allocation,
-            Decimal::ZERO,
+            source.surplus,
             source.spent,
+            amount,
         )?;
         self.emit(AccountEvent::SurplusTransferred {
-            from: from.to_string(),
-            to: to.to_string(),
+            from: *from,
+            to: *to,
+            amount,
         });
         Ok(())
     }
@@ -193,15 +236,15 @@ impl Account {
 
     pub fn reallocate_categories(
         &mut self,
-        allocations: HashMap<String, u8>,
+        allocations: HashMap<CategoryId, u8>,
     ) -> Result<(), AccountError> {
         preconditions::check_categories_match(&self.categories, &allocations)?;
         invariants::check_total_allocations(allocations.values().copied())?;
-        for (name, allocation) in &allocations {
-            let existing = self.categories.get(name).expect("keys matched");
+        for (id, allocation) in &allocations {
+            let existing = self.categories.get(id).expect("keys matched");
             Spending::new(*allocation, existing.spent, existing.surplus)?;
             invariants::check_spending_within_budget(
-                name,
+                id,
                 self.balance,
                 *allocation,
                 existing.surplus,
@@ -212,19 +255,16 @@ impl Account {
         Ok(())
     }
 
-    pub fn add_debt(&mut self, name: &str, amount: Decimal) -> Result<(), AccountError> {
-        preconditions::check_debt_absent(name, &self.debts)?;
-        self.emit(AccountEvent::DebtAdded {
-            name: name.to_string(),
-            amount,
-        });
-        Ok(())
+    pub fn add_debt(&mut self, amount: Decimal) -> Result<DebtId, AccountError> {
+        let id = DebtId::new_v7();
+        self.emit(AccountEvent::DebtAdded { id, amount });
+        Ok(id)
     }
 
     pub fn repay_debt(
         &mut self,
-        category: &str,
-        debt: &str,
+        category: &CategoryId,
+        debt: &DebtId,
         amount: Decimal,
     ) -> Result<(), AccountError> {
         preconditions::check_category_exists(category, &self.categories)?;
@@ -240,8 +280,8 @@ impl Account {
             spending.spent + amount,
         )?;
         self.emit(AccountEvent::DebtRepaid {
-            category: category.to_string(),
-            debt: debt.to_string(),
+            category: *category,
+            debt: *debt,
             amount,
         });
         Ok(())
@@ -249,13 +289,14 @@ impl Account {
 
     pub fn snapshot(&self) -> AccountState {
         AccountState {
+            id: self.id,
             balance: self.balance,
             categories: self
                 .categories
                 .iter()
-                .map(|(name, spending)| {
+                .map(|(id, spending)| {
                     (
-                        name.clone(),
+                        *id,
                         CategoryState {
                             allocation: spending.allocation,
                             spent: spending.spent,
@@ -270,13 +311,14 @@ impl Account {
 
     pub fn reconstitute(snapshot: AccountState, events: Option<Vec<AccountEvent>>) -> Account {
         let mut account = Account {
+            id: snapshot.id,
             balance: snapshot.balance,
             categories: snapshot
                 .categories
                 .into_iter()
-                .map(|(name, category)| {
+                .map(|(id, category)| {
                     (
-                        name,
+                        id,
                         Spending {
                             allocation: category.allocation,
                             spent: category.spent,
@@ -298,9 +340,9 @@ impl Account {
 
     fn apply(&mut self, event: &AccountEvent) {
         match event {
-            AccountEvent::CategoryAdded { name, allocation } => {
+            AccountEvent::CategoryAdded { id, allocation } => {
                 self.categories.insert(
-                    name.clone(),
+                    *id,
                     Spending {
                         allocation: *allocation,
                         spent: Decimal::ZERO,
@@ -308,8 +350,8 @@ impl Account {
                     },
                 );
             }
-            AccountEvent::CategoryRemoved { name } => {
-                let spending = self.categories.remove(name).expect("validated event");
+            AccountEvent::CategoryRemoved { id } => {
+                let spending = self.categories.remove(id).expect("validated event");
                 self.balance = removal_balance(self.balance, spending.surplus, spending.spent);
             }
             AccountEvent::RolledOver { income } => {
@@ -328,16 +370,15 @@ impl Account {
                     .expect("validated event")
                     .spent += *amount;
             }
-            AccountEvent::SurplusTransferred { from, to } => {
-                let surplus = self.categories.get(from).expect("validated event").surplus;
+            AccountEvent::SurplusTransferred { from, to, amount } => {
                 self.categories
                     .get_mut(from)
                     .expect("validated event")
-                    .surplus = Decimal::ZERO;
+                    .surplus -= *amount;
                 self.categories
                     .get_mut(to)
                     .expect("validated event")
-                    .surplus += surplus;
+                    .surplus += *amount;
             }
             AccountEvent::FundsAdded { amount } => {
                 self.balance += *amount;
@@ -346,15 +387,15 @@ impl Account {
                 self.balance -= *amount;
             }
             AccountEvent::CategoriesReallocated { allocations } => {
-                for (name, allocation) in allocations {
+                for (id, allocation) in allocations {
                     self.categories
-                        .get_mut(name)
+                        .get_mut(id)
                         .expect("validated event")
                         .allocation = *allocation;
                 }
             }
-            AccountEvent::DebtAdded { name, amount } => {
-                self.debts.insert(name.clone(), *amount);
+            AccountEvent::DebtAdded { id, amount } => {
+                self.debts.insert(*id, *amount);
             }
             AccountEvent::DebtRepaid {
                 category,
@@ -374,7 +415,7 @@ impl Account {
                 if remaining.is_zero() {
                     self.debts.remove(debt);
                 } else {
-                    self.debts.insert(debt.clone(), remaining);
+                    self.debts.insert(*debt, remaining);
                 }
             }
         }
@@ -389,6 +430,7 @@ impl Account {
 impl Default for Account {
     fn default() -> Self {
         Self {
+            id: AccountId::new_v7(),
             balance: Decimal::ZERO,
             categories: HashMap::new(),
             debts: HashMap::new(),
@@ -413,7 +455,10 @@ impl Spending {
 }
 
 mod invariants {
-    use super::{AccountInvariantError, Decimal, MAX_ALLOCATION, Spending, budget};
+    use super::{
+        AccountInvariantError, CategoryId, DebtId, Decimal, MAX_ALLOCATION, Spending,
+        available_surplus,
+    };
 
     pub(super) fn check_negative_balance(
         balance: Decimal,
@@ -436,18 +481,15 @@ mod invariants {
     }
 
     pub(super) fn check_spending_within_budget(
-        name: &str,
+        id: &CategoryId,
         balance: Decimal,
         allocation: u8,
         surplus: Decimal,
         spent: Decimal,
     ) -> Result<(), AccountInvariantError> {
-        if spent > budget(balance, allocation) + surplus {
+        if available_surplus(balance, allocation, surplus, spent).is_err() {
             return Err(AccountInvariantError::SpendingExceedsAllocation(
-                name.to_string(),
-                spent,
-                allocation,
-                surplus,
+                *id, spent, allocation, surplus,
             ));
         }
         Ok(())
@@ -455,11 +497,11 @@ mod invariants {
 
     pub(super) fn check_all_spending_within_budget<'a>(
         balance: Decimal,
-        categories: impl IntoIterator<Item = (&'a String, &'a Spending)>,
+        categories: impl IntoIterator<Item = (&'a CategoryId, &'a Spending)>,
     ) -> Result<(), AccountInvariantError> {
-        for (name, spending) in categories {
+        for (id, spending) in categories {
             check_spending_within_budget(
-                name,
+                id,
                 balance,
                 spending.allocation,
                 spending.surplus,
@@ -482,26 +524,36 @@ mod invariants {
         surplus: Decimal,
         spent: Decimal,
     ) -> Result<(), AccountInvariantError> {
-        let covered = surplus
-            .safe_add(budget(balance, allocation))
-            .and_then(|total| total.safe_sub(spent));
-        if covered.is_err() {
-            return Err(AccountInvariantError::NegativeSurplus);
+        available_surplus(balance, allocation, surplus, spent)
+            .map(|_| ())
+            .map_err(|_| AccountInvariantError::NegativeSurplus)
+    }
+
+    pub(super) fn check_transfer_within_surplus(
+        id: &CategoryId,
+        balance: Decimal,
+        allocation: u8,
+        surplus: Decimal,
+        spent: Decimal,
+        amount: Decimal,
+    ) -> Result<(), AccountInvariantError> {
+        let available = available_surplus(balance, allocation, surplus, spent)
+            .map_err(|_| AccountInvariantError::NegativeSurplus)?;
+        if amount > available {
+            return Err(AccountInvariantError::InsufficientSurplus(
+                *id, available, amount,
+            ));
         }
         Ok(())
     }
 
     pub(super) fn check_debt_within_owed(
-        name: &str,
+        id: &DebtId,
         owed: Decimal,
         amount: Decimal,
     ) -> Result<(), AccountInvariantError> {
         if owed.safe_sub(amount).is_err() {
-            return Err(AccountInvariantError::DebtOverpayment(
-                name.to_string(),
-                owed,
-                amount,
-            ));
+            return Err(AccountInvariantError::DebtOverpayment(*id, owed, amount));
         }
         Ok(())
     }
@@ -510,92 +562,66 @@ mod invariants {
 mod preconditions {
     use std::collections::HashMap;
 
-    use super::{AccountPreconditionError, Decimal, Spending};
+    use super::{AccountPreconditionError, CategoryId, DebtId, Decimal, Spending};
 
     pub(super) fn check_category_exists(
-        name: &str,
-        categories: &HashMap<String, Spending>,
+        id: &CategoryId,
+        categories: &HashMap<CategoryId, Spending>,
     ) -> Result<(), AccountPreconditionError> {
-        if !categories.contains_key(name) {
-            return Err(AccountPreconditionError::CategoryNotFound(name.to_string()));
-        }
-        Ok(())
-    }
-
-    pub(super) fn check_category_absent(
-        name: &str,
-        categories: &HashMap<String, Spending>,
-    ) -> Result<(), AccountPreconditionError> {
-        if categories.contains_key(name) {
-            return Err(AccountPreconditionError::DuplicateCategory(
-                name.to_string(),
-            ));
+        if !categories.contains_key(id) {
+            return Err(AccountPreconditionError::CategoryNotFound(*id));
         }
         Ok(())
     }
 
     pub(super) fn check_distinct_source_target(
-        from: &str,
-        to: &str,
+        from: &CategoryId,
+        to: &CategoryId,
     ) -> Result<(), AccountPreconditionError> {
         if from == to {
-            return Err(AccountPreconditionError::SameCategory(from.to_string()));
+            return Err(AccountPreconditionError::SameCategory(*from));
         }
         Ok(())
     }
 
     pub(super) fn check_source_exists(
-        from: &str,
-        categories: &HashMap<String, Spending>,
+        from: &CategoryId,
+        categories: &HashMap<CategoryId, Spending>,
     ) -> Result<(), AccountPreconditionError> {
         if !categories.contains_key(from) {
-            return Err(AccountPreconditionError::SourceCategoryNotFound(
-                from.to_string(),
-            ));
+            return Err(AccountPreconditionError::SourceCategoryNotFound(*from));
         }
         Ok(())
     }
 
     pub(super) fn check_target_exists(
-        to: &str,
-        categories: &HashMap<String, Spending>,
+        to: &CategoryId,
+        categories: &HashMap<CategoryId, Spending>,
     ) -> Result<(), AccountPreconditionError> {
         if !categories.contains_key(to) {
-            return Err(AccountPreconditionError::TargetCategoryNotFound(
-                to.to_string(),
-            ));
+            return Err(AccountPreconditionError::TargetCategoryNotFound(*to));
         }
         Ok(())
     }
 
     pub(super) fn check_categories_match(
-        categories: &HashMap<String, Spending>,
-        allocations: &HashMap<String, u8>,
+        categories: &HashMap<CategoryId, Spending>,
+        allocations: &HashMap<CategoryId, u8>,
     ) -> Result<(), AccountPreconditionError> {
         if categories.len() != allocations.len()
-            || !categories.keys().all(|name| allocations.contains_key(name))
+            || !categories.keys().all(|id| allocations.contains_key(id))
         {
             return Err(AccountPreconditionError::UnmatchedCategories);
         }
         Ok(())
     }
 
-    pub(super) fn check_debt_absent(
-        name: &str,
-        debts: &HashMap<String, Decimal>,
-    ) -> Result<(), AccountPreconditionError> {
-        if debts.contains_key(name) {
-            return Err(AccountPreconditionError::DuplicateDebt(name.to_string()));
-        }
-        Ok(())
-    }
-
     pub(super) fn check_debt_exists(
-        name: &str,
-        debts: &HashMap<String, Decimal>,
+        id: &DebtId,
+        debts: &HashMap<DebtId, Decimal>,
     ) -> Result<(), AccountPreconditionError> {
-        if !debts.contains_key(name) {
-            return Err(AccountPreconditionError::DebtNotFound(name.to_string()));
+        if !debts.contains_key(id) {
+            return Err(AccountPreconditionError::DebtNotFound(*id));
         }
         Ok(())
     }
@@ -613,28 +639,22 @@ pub enum AccountError {
 #[derive(Error, Debug)]
 pub enum AccountPreconditionError {
     #[error("category {0} does not exist")]
-    CategoryNotFound(String),
-
-    #[error("duplicate category: {0}")]
-    DuplicateCategory(String),
+    CategoryNotFound(CategoryId),
 
     #[error("transfer source and target are the same: {0}")]
-    SameCategory(String),
+    SameCategory(CategoryId),
 
     #[error("transfer source {0} does not exist")]
-    SourceCategoryNotFound(String),
+    SourceCategoryNotFound(CategoryId),
 
     #[error("transfer target {0} does not exist")]
-    TargetCategoryNotFound(String),
+    TargetCategoryNotFound(CategoryId),
 
     #[error("requested list of categories do not match existing ones")]
     UnmatchedCategories,
 
-    #[error("duplicate debt: {0}")]
-    DuplicateDebt(String),
-
     #[error("debt {0} does not exist")]
-    DebtNotFound(String),
+    DebtNotFound(DebtId),
 }
 
 #[derive(Error, Debug)]
@@ -646,7 +666,7 @@ pub enum AccountInvariantError {
     TotalAllocations(u32),
 
     #[error("category {0} spending ({1}) exceeds the allocation ({2}) plus surplus ({3})")]
-    SpendingExceedsAllocation(String, Decimal, u8, Decimal),
+    SpendingExceedsAllocation(CategoryId, Decimal, u8, Decimal),
 
     #[error("allocation ({0}) exceeds the limit ({MAX_ALLOCATION})")]
     AllocationLimit(u8),
@@ -654,8 +674,11 @@ pub enum AccountInvariantError {
     #[error("surplus would be negative")]
     NegativeSurplus,
 
+    #[error("category {0} has insufficient available surplus ({1}) to transfer {2}")]
+    InsufficientSurplus(CategoryId, Decimal, Decimal),
+
     #[error("debt {0} repayment ({2}) exceeds owed ({1})")]
-    DebtOverpayment(String, Decimal, Decimal),
+    DebtOverpayment(DebtId, Decimal, Decimal),
 }
 
 #[cfg(test)]
@@ -663,18 +686,27 @@ mod account_tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn account_with(balance: Decimal, allocations: &[(&str, u8)]) -> Account {
+    fn account_with(
+        balance: Decimal,
+        allocations: &[(&str, u8)],
+    ) -> (Account, HashMap<String, CategoryId>) {
         let mut account = Account::default();
         account.add_funds(balance).unwrap();
-        for (name, allocation) in allocations {
-            account.add_category(name, *allocation).unwrap();
-        }
-        account
+        let ids = allocations
+            .iter()
+            .map(|(name, allocation)| {
+                let id = account.add_category(*allocation).unwrap();
+                ((*name).to_string(), id)
+            })
+            .collect();
+        (account, ids)
     }
 
     #[test]
     fn default_is_empty() {
-        let state = Account::default().snapshot();
+        let account = Account::default();
+        let state = account.snapshot();
+        assert_eq!(state.id, *account.id());
         assert_eq!(state.balance, Decimal::ZERO);
         assert!(state.categories.is_empty());
         assert!(state.debts.is_empty());
@@ -682,12 +714,12 @@ mod account_tests {
 
     #[test]
     fn add_category_succeeds() {
-        let mut account = account_with(Decimal::from(1000u64), &[]);
-        account.add_category("test", 10).unwrap();
+        let (mut account, _) = account_with(Decimal::from(1000u64), &[]);
+        let id = account.add_category(10).unwrap();
         let state = account.snapshot();
         assert_eq!(state.balance, Decimal::from(1000u64));
         assert_eq!(
-            state.categories.get("test").unwrap(),
+            state.categories.get(&id).unwrap(),
             &CategoryState {
                 allocation: 10,
                 spent: Decimal::ZERO,
@@ -697,9 +729,19 @@ mod account_tests {
     }
 
     #[test]
+    fn add_debt_returns_id() {
+        let (mut account, _) = account_with(Decimal::from(1000u64), &[]);
+        let id = account.add_debt(Decimal::from(400u64)).unwrap();
+        assert_eq!(
+            account.snapshot().debts.get(&id),
+            Some(&Decimal::from(400u64))
+        );
+    }
+
+    #[test]
     fn remove_category_succeeds() {
-        let mut account = account_with(Decimal::from(1000u64), &[("test", 10)]);
-        account.remove_category("test").unwrap();
+        let (mut account, cats) = account_with(Decimal::from(1000u64), &[("test", 10)]);
+        account.remove_category(&cats["test"]).unwrap();
         let state = account.snapshot();
         assert_eq!(state.balance, Decimal::from(1000u64));
         assert!(state.categories.is_empty());
@@ -707,37 +749,43 @@ mod account_tests {
 
     #[test]
     fn remove_after_transferring_surplus() {
-        let mut account = account_with(
+        let (mut account, cats) = account_with(
             Decimal::from(10000u64),
             &[("a", MAX_ALLOCATION / 2), ("b", MAX_ALLOCATION / 4)],
         );
         account.rollover(Decimal::ZERO).unwrap();
-        account.transfer_surplus("a", "b").unwrap();
-        account.remove_category("a").unwrap();
+        let surplus_a = Decimal::from(10000u64) * (MAX_ALLOCATION / 2) / MAX_ALLOCATION;
+        account
+            .transfer_surplus(&cats["a"], &cats["b"], surplus_a)
+            .unwrap();
+        account.remove_category(&cats["a"]).unwrap();
         let state = account.snapshot();
-        assert!(!state.categories.contains_key("a"));
+        assert!(!state.categories.contains_key(&cats["a"]));
         let surplus_b = Decimal::from(10000u64) * (MAX_ALLOCATION / 4) / MAX_ALLOCATION
             + Decimal::from(10000u64) * (MAX_ALLOCATION / 2) / MAX_ALLOCATION;
-        assert_eq!(state.categories.get("b").unwrap().surplus, surplus_b);
+        assert_eq!(state.categories.get(&cats["b"]).unwrap().surplus, surplus_b);
     }
 
     #[test]
     fn rollover_flushes_balance_into_surplus_and_resets_spent() {
-        let mut account = account_with(
+        let (mut account, cats) = account_with(
             Decimal::from(10000u64),
             &[("a", MAX_ALLOCATION / 2), ("b", MAX_ALLOCATION / 4)],
         );
-        account.spend("a", Decimal::from(1000u64)).unwrap();
+        account.spend(&cats["a"], Decimal::from(1000u64)).unwrap();
         account.rollover(Decimal::from(5000u64)).unwrap();
         let state = account.snapshot();
         let budget_a = Decimal::from(10000u64) * (MAX_ALLOCATION / 2) / MAX_ALLOCATION;
         let budget_b = Decimal::from(10000u64) * (MAX_ALLOCATION / 4) / MAX_ALLOCATION;
         assert_eq!(
-            state.categories.get("a").unwrap().surplus,
+            state.categories.get(&cats["a"]).unwrap().surplus,
             budget_a - Decimal::from(1000u64)
         );
-        assert_eq!(state.categories.get("b").unwrap().surplus, budget_b);
-        assert_eq!(state.categories.get("a").unwrap().spent, Decimal::ZERO);
+        assert_eq!(state.categories.get(&cats["b"]).unwrap().surplus, budget_b);
+        assert_eq!(
+            state.categories.get(&cats["a"]).unwrap().spent,
+            Decimal::ZERO
+        );
         assert_eq!(
             state.balance,
             Decimal::from(5000u64) + (Decimal::from(10000u64) - (budget_a + budget_b))
@@ -746,7 +794,7 @@ mod account_tests {
 
     #[test]
     fn rollover_with_full_allocation_leaves_only_income() {
-        let mut account = account_with(
+        let (mut account, _) = account_with(
             Decimal::from(10000u64),
             &[("a", MAX_ALLOCATION / 2), ("b", MAX_ALLOCATION / 2)],
         );
@@ -757,8 +805,9 @@ mod account_tests {
 
     #[test]
     fn rollover_expenses_spent_from_total() {
-        let mut account = account_with(Decimal::from(10000u64), &[("a", MAX_ALLOCATION / 2)]);
-        account.spend("a", Decimal::from(1000u64)).unwrap();
+        let (mut account, cats) =
+            account_with(Decimal::from(10000u64), &[("a", MAX_ALLOCATION / 2)]);
+        account.spend(&cats["a"], Decimal::from(1000u64)).unwrap();
         account.rollover(Decimal::from(5000u64)).unwrap();
         let state = account.snapshot();
         let budget_a = Decimal::from(10000u64) * (MAX_ALLOCATION / 2) / MAX_ALLOCATION;
@@ -767,16 +816,17 @@ mod account_tests {
             Decimal::from(5000u64) + (Decimal::from(10000u64) - budget_a)
         );
         assert_eq!(
-            state.categories.get("a").unwrap().surplus,
+            state.categories.get(&cats["a"]).unwrap().surplus,
             budget_a - Decimal::from(1000u64)
         );
     }
 
     #[test]
     fn rollover_accumulates_existing_surplus() {
-        let mut account = account_with(Decimal::from(10000u64), &[("a", MAX_ALLOCATION / 2)]);
+        let (mut account, cats) =
+            account_with(Decimal::from(10000u64), &[("a", MAX_ALLOCATION / 2)]);
         account.rollover(Decimal::ZERO).unwrap();
-        account.spend("a", Decimal::from(2000u64)).unwrap();
+        account.spend(&cats["a"], Decimal::from(2000u64)).unwrap();
         account.rollover(Decimal::ZERO).unwrap();
         let state = account.snapshot();
         let first_budget = Decimal::from(10000u64) * (MAX_ALLOCATION / 2) / MAX_ALLOCATION;
@@ -784,10 +834,13 @@ mod account_tests {
             (Decimal::from(10000u64) - first_budget) * (MAX_ALLOCATION / 2) / MAX_ALLOCATION;
         let increment = second_budget - Decimal::from(2000u64);
         assert_eq!(
-            state.categories.get("a").unwrap().surplus,
+            state.categories.get(&cats["a"]).unwrap().surplus,
             first_budget + increment
         );
-        assert_eq!(state.categories.get("a").unwrap().spent, Decimal::ZERO);
+        assert_eq!(
+            state.categories.get(&cats["a"]).unwrap().spent,
+            Decimal::ZERO
+        );
         assert_eq!(
             state.balance,
             (Decimal::from(10000u64) - first_budget) - second_budget
@@ -796,72 +849,80 @@ mod account_tests {
 
     #[test]
     fn remove_category_settles_spent_into_balance() {
-        let mut account = account_with(Decimal::from(10000u64), &[("a", MAX_ALLOCATION / 4)]);
-        account.spend("a", Decimal::from(1000u64)).unwrap();
-        account.remove_category("a").unwrap();
+        let (mut account, cats) =
+            account_with(Decimal::from(10000u64), &[("a", MAX_ALLOCATION / 4)]);
+        account.spend(&cats["a"], Decimal::from(1000u64)).unwrap();
+        account.remove_category(&cats["a"]).unwrap();
         let state = account.snapshot();
         assert_eq!(state.balance, Decimal::from(9000u64));
-        assert!(!state.categories.contains_key("a"));
+        assert!(!state.categories.contains_key(&cats["a"]));
     }
 
     #[test]
     fn remove_category_fails_when_sibling_exceeds_shrunken_budget() {
-        let mut account = account_with(
+        let (mut account, cats) = account_with(
             Decimal::from(10000u64),
             &[("a", MAX_ALLOCATION / 2), ("b", MAX_ALLOCATION / 2)],
         );
         let full_budget = Decimal::from(10000u64) * (MAX_ALLOCATION / 2) / MAX_ALLOCATION;
-        account.spend("a", full_budget).unwrap();
-        account.spend("b", full_budget).unwrap();
-        let result = account.remove_category("a");
+        account.spend(&cats["a"], full_budget).unwrap();
+        account.spend(&cats["b"], full_budget).unwrap();
+        let result = account.remove_category(&cats["a"]);
         assert!(matches!(
             result,
             Err(AccountError::Invariant(
-                AccountInvariantError::SpendingExceedsAllocation(name, _, _, _)
-            )) if name == "b"
+                AccountInvariantError::SpendingExceedsAllocation(id, _, _, _)
+            )) if id == cats["b"]
         ));
     }
 
     #[test]
     fn remove_category_returns_surplus_to_balance() {
-        let mut account = account_with(Decimal::from(10000u64), &[("a", MAX_ALLOCATION / 2)]);
+        let (mut account, cats) =
+            account_with(Decimal::from(10000u64), &[("a", MAX_ALLOCATION / 2)]);
         account.rollover(Decimal::ZERO).unwrap();
-        account.remove_category("a").unwrap();
+        account.remove_category(&cats["a"]).unwrap();
         let state = account.snapshot();
         assert_eq!(state.balance, Decimal::from(10000u64));
-        assert!(!state.categories.contains_key("a"));
+        assert!(!state.categories.contains_key(&cats["a"]));
     }
 
     #[test]
     fn remove_category_settles_surplus_minus_spent() {
-        let mut account = account_with(
+        let (mut account, cats) = account_with(
             Decimal::from(10000u64),
             &[("a", MAX_ALLOCATION / 2), ("b", MAX_ALLOCATION / 2)],
         );
         account.rollover(Decimal::ZERO).unwrap();
-        account.spend("a", Decimal::from(1000u64)).unwrap();
-        account.remove_category("a").unwrap();
+        account.spend(&cats["a"], Decimal::from(1000u64)).unwrap();
+        account.remove_category(&cats["a"]).unwrap();
         let state = account.snapshot();
         let surplus_a = Decimal::from(10000u64) * (MAX_ALLOCATION / 2) / MAX_ALLOCATION;
         assert_eq!(state.balance, surplus_a - Decimal::from(1000u64));
-        assert!(!state.categories.contains_key("a"));
+        assert!(!state.categories.contains_key(&cats["a"]));
     }
 
     #[test]
-    fn transfer_surplus_moves_entire_surplus() {
-        let mut account = account_with(
+    fn transfer_surplus_moves_given_amount() {
+        let (mut account, cats) = account_with(
             Decimal::from(10000u64),
             &[("a", MAX_ALLOCATION / 2), ("b", MAX_ALLOCATION / 4)],
         );
         account.rollover(Decimal::ZERO).unwrap();
-        account.transfer_surplus("a", "b").unwrap();
-        let state = account.snapshot();
         let surplus_a = Decimal::from(10000u64) * (MAX_ALLOCATION / 2) / MAX_ALLOCATION;
         let surplus_b = Decimal::from(10000u64) * (MAX_ALLOCATION / 4) / MAX_ALLOCATION;
-        assert_eq!(state.categories.get("a").unwrap().surplus, Decimal::ZERO);
+        let amount = surplus_a / 2u8;
+        account
+            .transfer_surplus(&cats["a"], &cats["b"], amount)
+            .unwrap();
+        let state = account.snapshot();
         assert_eq!(
-            state.categories.get("b").unwrap().surplus,
-            surplus_a + surplus_b
+            state.categories.get(&cats["a"]).unwrap().surplus,
+            surplus_a - amount
+        );
+        assert_eq!(
+            state.categories.get(&cats["b"]).unwrap().surplus,
+            surplus_b + amount
         );
         assert_eq!(
             state.balance,
@@ -870,27 +931,50 @@ mod account_tests {
     }
 
     #[test]
+    fn transfer_surplus_of_full_available_empties_source() {
+        let (mut account, cats) = account_with(
+            Decimal::from(10000u64),
+            &[("a", MAX_ALLOCATION / 2), ("b", MAX_ALLOCATION / 4)],
+        );
+        account.rollover(Decimal::ZERO).unwrap();
+        let surplus_a = Decimal::from(10000u64) * (MAX_ALLOCATION / 2) / MAX_ALLOCATION;
+        let surplus_b = Decimal::from(10000u64) * (MAX_ALLOCATION / 4) / MAX_ALLOCATION;
+        account
+            .transfer_surplus(&cats["a"], &cats["b"], surplus_a)
+            .unwrap();
+        let state = account.snapshot();
+        assert_eq!(
+            state.categories.get(&cats["a"]).unwrap().surplus,
+            Decimal::ZERO
+        );
+        assert_eq!(
+            state.categories.get(&cats["b"]).unwrap().surplus,
+            surplus_a + surplus_b
+        );
+    }
+
+    #[test]
     fn reallocate_successful() {
-        let mut account = account_with(
+        let (mut account, cats) = account_with(
             Decimal::from(10000u64),
             &[("a", MAX_ALLOCATION / 2), ("b", MAX_ALLOCATION / 2)],
         );
         let result = account.reallocate_categories(HashMap::from([
-            ("a".to_string(), MAX_ALLOCATION / 4),
-            ("b".to_string(), MAX_ALLOCATION - MAX_ALLOCATION / 4),
+            (cats["a"], MAX_ALLOCATION / 4),
+            (cats["b"], MAX_ALLOCATION - MAX_ALLOCATION / 4),
         ]));
         assert!(result.is_ok());
     }
 
     #[test]
     fn snapshot_reconstitute_roundtrip() {
-        let mut account = account_with(
+        let (mut account, cats) = account_with(
             Decimal::from(10000u64),
             &[("a", MAX_ALLOCATION / 2), ("b", MAX_ALLOCATION / 4)],
         );
-        account.spend("a", Decimal::from(1000u64)).unwrap();
+        account.spend(&cats["a"], Decimal::from(1000u64)).unwrap();
         account.rollover(Decimal::from(5000u64)).unwrap();
-        account.spend("a", Decimal::from(6000u64)).unwrap();
+        account.spend(&cats["a"], Decimal::from(6000u64)).unwrap();
         let state = account.snapshot();
         let reconstituted = Account::reconstitute(state.clone(), None);
         assert_eq!(reconstituted.snapshot(), state);
@@ -898,9 +982,10 @@ mod account_tests {
 
     #[test]
     fn reconstitute_applies_trailing_events() {
-        let mut account = account_with(Decimal::from(10000u64), &[("a", MAX_ALLOCATION / 4)]);
+        let (mut account, cats) =
+            account_with(Decimal::from(10000u64), &[("a", MAX_ALLOCATION / 4)]);
         let base = account.snapshot();
-        account.spend("a", Decimal::from(1000u64)).unwrap();
+        account.spend(&cats["a"], Decimal::from(1000u64)).unwrap();
         account.rollover(Decimal::from(500u64)).unwrap();
         let final_state = account.snapshot();
 
@@ -908,7 +993,7 @@ mod account_tests {
             base,
             Some(vec![
                 AccountEvent::Spent {
-                    category: "a".to_string(),
+                    category: cats["a"],
                     amount: Decimal::from(1000u64),
                 },
                 AccountEvent::RolledOver {
@@ -920,8 +1005,34 @@ mod account_tests {
     }
 
     #[test]
+    fn reconstitute_replays_transfer_events() {
+        let (mut account, cats) = account_with(
+            Decimal::from(10000u64),
+            &[("a", MAX_ALLOCATION / 2), ("b", MAX_ALLOCATION / 4)],
+        );
+        account.rollover(Decimal::ZERO).unwrap();
+        let base = account.snapshot();
+        let amount = Decimal::from(500u64);
+        account
+            .transfer_surplus(&cats["a"], &cats["b"], amount)
+            .unwrap();
+        let final_state = account.snapshot();
+
+        let replayed = Account::reconstitute(
+            base,
+            Some(vec![AccountEvent::SurplusTransferred {
+                from: cats["a"],
+                to: cats["b"],
+                amount,
+            }]),
+        );
+        assert_eq!(replayed.snapshot(), final_state);
+    }
+
+    #[test]
     fn reconstitute_replays_events_without_recording() {
-        let snapshot = account_with(Decimal::from(1000u64), &[("a", 10)]).snapshot();
+        let (account, _) = account_with(Decimal::from(1000u64), &[("a", 10)]);
+        let snapshot = account.snapshot();
         let account = Account::reconstitute(
             snapshot,
             Some(vec![AccountEvent::FundsAdded {
@@ -929,25 +1040,25 @@ mod account_tests {
             }]),
         );
         assert_eq!(account.snapshot().balance, Decimal::from(1100u64));
-        assert!(account.events.is_empty());
+        assert!(account.events().is_empty());
     }
 
     #[test]
     fn spend_records_emitted_event() {
-        let mut account = account_with(Decimal::from(1000u64), &[("a", 10)]);
-        account.spend("a", Decimal::from(5u64)).unwrap();
+        let (mut account, cats) = account_with(Decimal::from(1000u64), &[("a", 10)]);
+        account.spend(&cats["a"], Decimal::from(5u64)).unwrap();
         assert_eq!(
-            account.events,
-            vec![
+            account.events(),
+            &[
                 AccountEvent::FundsAdded {
                     amount: Decimal::from(1000u64),
                 },
                 AccountEvent::CategoryAdded {
-                    name: "a".to_string(),
+                    id: cats["a"],
                     allocation: 10,
                 },
                 AccountEvent::Spent {
-                    category: "a".to_string(),
+                    category: cats["a"],
                     amount: Decimal::from(5u64),
                 },
             ]
@@ -955,51 +1066,55 @@ mod account_tests {
     }
 
     #[test]
-    fn add_debt_tracks_owed() {
-        let mut account = account_with(Decimal::from(1000u64), &[]);
-        account.add_debt("loan", Decimal::from(400u64)).unwrap();
-        let state = account.snapshot();
-        assert_eq!(state.debts.get("loan"), Some(&Decimal::from(400u64)));
+    fn mark_committed_clears_recorded_events() {
+        let (mut account, cats) = account_with(Decimal::from(1000u64), &[("a", 10)]);
+        account.spend(&cats["a"], Decimal::from(5u64)).unwrap();
+        assert!(!account.events().is_empty());
+        account.mark_committed();
+        assert!(account.events().is_empty());
     }
 
     #[test]
     fn repay_debt_adds_on_top_of_spent() {
-        let mut account = account_with(Decimal::from(10000u64), &[("a", MAX_ALLOCATION / 2)]);
-        account.add_debt("loan", Decimal::from(1000u64)).unwrap();
-        account.spend("a", Decimal::from(1000u64)).unwrap();
+        let (mut account, cats) =
+            account_with(Decimal::from(10000u64), &[("a", MAX_ALLOCATION / 2)]);
+        let loan = account.add_debt(Decimal::from(1000u64)).unwrap();
+        account.spend(&cats["a"], Decimal::from(1000u64)).unwrap();
         account
-            .repay_debt("a", "loan", Decimal::from(400u64))
+            .repay_debt(&cats["a"], &loan, Decimal::from(400u64))
             .unwrap();
         let state = account.snapshot();
         assert_eq!(
-            state.categories.get("a").unwrap().spent,
+            state.categories.get(&cats["a"]).unwrap().spent,
             Decimal::from(1400u64)
         );
-        assert_eq!(state.debts.get("loan"), Some(&Decimal::from(600u64)));
+        assert_eq!(state.debts.get(&loan), Some(&Decimal::from(600u64)));
         assert_eq!(state.balance, Decimal::from(10000u64));
     }
 
     #[test]
     fn repay_debt_in_full_removes_entry() {
-        let mut account = account_with(Decimal::from(10000u64), &[("a", MAX_ALLOCATION / 2)]);
-        account.add_debt("loan", Decimal::from(400u64)).unwrap();
+        let (mut account, cats) =
+            account_with(Decimal::from(10000u64), &[("a", MAX_ALLOCATION / 2)]);
+        let loan = account.add_debt(Decimal::from(400u64)).unwrap();
         account
-            .repay_debt("a", "loan", Decimal::from(400u64))
+            .repay_debt(&cats["a"], &loan, Decimal::from(400u64))
             .unwrap();
         let state = account.snapshot();
-        assert!(!state.debts.contains_key("loan"));
+        assert!(!state.debts.contains_key(&loan));
         assert_eq!(
-            state.categories.get("a").unwrap().spent,
+            state.categories.get(&cats["a"]).unwrap().spent,
             Decimal::from(400u64)
         );
     }
 
     #[test]
     fn debt_snapshot_reconstitute_roundtrip() {
-        let mut account = account_with(Decimal::from(10000u64), &[("a", MAX_ALLOCATION / 2)]);
-        account.add_debt("loan", Decimal::from(1000u64)).unwrap();
+        let (mut account, cats) =
+            account_with(Decimal::from(10000u64), &[("a", MAX_ALLOCATION / 2)]);
+        let loan = account.add_debt(Decimal::from(1000u64)).unwrap();
         account
-            .repay_debt("a", "loan", Decimal::from(400u64))
+            .repay_debt(&cats["a"], &loan, Decimal::from(400u64))
             .unwrap();
         let state = account.snapshot();
         let reconstituted = Account::reconstitute(state.clone(), None);
@@ -1008,11 +1123,12 @@ mod account_tests {
 
     #[test]
     fn reconstitute_replays_debt_events() {
-        let mut account = account_with(Decimal::from(10000u64), &[("a", MAX_ALLOCATION / 2)]);
+        let (mut account, cats) =
+            account_with(Decimal::from(10000u64), &[("a", MAX_ALLOCATION / 2)]);
         let base = account.snapshot();
-        account.add_debt("loan", Decimal::from(1000u64)).unwrap();
+        let loan = account.add_debt(Decimal::from(1000u64)).unwrap();
         account
-            .repay_debt("a", "loan", Decimal::from(400u64))
+            .repay_debt(&cats["a"], &loan, Decimal::from(400u64))
             .unwrap();
         let final_state = account.snapshot();
 
@@ -1020,12 +1136,12 @@ mod account_tests {
             base,
             Some(vec![
                 AccountEvent::DebtAdded {
-                    name: "loan".to_string(),
+                    id: loan,
                     amount: Decimal::from(1000u64),
                 },
                 AccountEvent::DebtRepaid {
-                    category: "a".to_string(),
-                    debt: "loan".to_string(),
+                    category: cats["a"],
+                    debt: loan,
                     amount: Decimal::from(400u64),
                 },
             ]),
@@ -1038,6 +1154,14 @@ mod account_tests {
 mod invariants_tests {
     use super::*;
     use std::collections::HashMap;
+
+    fn category_id(seed: u128) -> CategoryId {
+        CategoryId::from(uuid::Uuid::from_u128(seed))
+    }
+
+    fn debt_id(seed: u128) -> DebtId {
+        DebtId::from(uuid::Uuid::from_u128(seed))
+    }
 
     #[test]
     fn deduction_exceeding_balance_fails() {
@@ -1075,7 +1199,7 @@ mod invariants_tests {
         let spent = budget(balance, allocation) + Decimal::from(500u64);
         assert!(
             invariants::check_spending_within_budget(
-                "a",
+                &category_id(0),
                 balance,
                 allocation,
                 Decimal::from(500u64),
@@ -1092,13 +1216,14 @@ mod invariants_tests {
         let spent = budget(balance, allocation) + Decimal::from(500u64) + Decimal::new(1_000_000);
         assert!(matches!(
             invariants::check_spending_within_budget(
-                "a",
+                &category_id(0),
                 balance,
                 allocation,
                 Decimal::from(500u64),
                 spent
             ),
-            Err(AccountInvariantError::SpendingExceedsAllocation(name, _, _, _)) if name == "a"
+            Err(AccountInvariantError::SpendingExceedsAllocation(id, _, _, _))
+                if id == category_id(0)
         ));
     }
 
@@ -1106,7 +1231,7 @@ mod invariants_tests {
     fn all_spending_within_budget_passes() {
         let categories = HashMap::from([
             (
-                "a".to_string(),
+                category_id(0),
                 Spending {
                     allocation: MAX_ALLOCATION / 2,
                     spent: Decimal::ZERO,
@@ -1114,7 +1239,7 @@ mod invariants_tests {
                 },
             ),
             (
-                "b".to_string(),
+                category_id(1),
                 Spending {
                     allocation: MAX_ALLOCATION / 2,
                     spent: Decimal::ZERO,
@@ -1132,7 +1257,7 @@ mod invariants_tests {
     fn all_spending_checks_each_category() {
         let categories = HashMap::from([
             (
-                "a".to_string(),
+                category_id(0),
                 Spending {
                     allocation: MAX_ALLOCATION / 2,
                     spent: Decimal::ZERO,
@@ -1140,7 +1265,7 @@ mod invariants_tests {
                 },
             ),
             (
-                "b".to_string(),
+                category_id(1),
                 Spending {
                     allocation: MAX_ALLOCATION / 2,
                     spent: budget(Decimal::from(1000u64), MAX_ALLOCATION / 2) + Decimal::from(1u64),
@@ -1150,7 +1275,8 @@ mod invariants_tests {
         ]);
         assert!(matches!(
             invariants::check_all_spending_within_budget(Decimal::from(1000u64), &categories),
-            Err(AccountInvariantError::SpendingExceedsAllocation(name, _, _, _)) if name == "b"
+            Err(AccountInvariantError::SpendingExceedsAllocation(id, _, _, _))
+                if id == category_id(1)
         ));
     }
 
@@ -1207,10 +1333,135 @@ mod invariants_tests {
     }
 
     #[test]
+    fn transfer_within_available_surplus_passes() {
+        assert!(
+            invariants::check_transfer_within_surplus(
+                &category_id(0),
+                Decimal::from(10000u64),
+                MAX_ALLOCATION / 2,
+                Decimal::from(500u64),
+                Decimal::from(4000u64),
+                Decimal::from(400u64),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn transfer_exactly_available_surplus_passes() {
+        assert!(
+            invariants::check_transfer_within_surplus(
+                &category_id(0),
+                Decimal::from(10000u64),
+                MAX_ALLOCATION / 2,
+                Decimal::from(500u64),
+                Decimal::from(4000u64),
+                Decimal::from(500u64),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn transfer_of_zero_passes() {
+        assert!(
+            invariants::check_transfer_within_surplus(
+                &category_id(0),
+                Decimal::from(10000u64),
+                MAX_ALLOCATION / 2,
+                Decimal::ZERO,
+                Decimal::ZERO,
+                Decimal::ZERO,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn transfer_exceeding_available_surplus_fails() {
+        assert!(matches!(
+            invariants::check_transfer_within_surplus(
+                &category_id(0),
+                Decimal::from(10000u64),
+                MAX_ALLOCATION / 2,
+                Decimal::from(500u64),
+                Decimal::from(4000u64),
+                Decimal::from(501u64),
+            ),
+            Err(AccountInvariantError::InsufficientSurplus(id, available, amount))
+                if id == category_id(0)
+                    && available == Decimal::from(500u64)
+                    && amount == Decimal::from(501u64)
+        ));
+    }
+
+    #[test]
+    fn transfer_limited_by_overspending_passes() {
+        let balance = Decimal::from(10000u64);
+        let allocation = MAX_ALLOCATION / 2;
+        let overspent = Decimal::from(200u64);
+        let surplus = Decimal::from(500u64);
+        let spent = budget(balance, allocation) + overspent;
+        assert!(
+            invariants::check_transfer_within_surplus(
+                &category_id(0),
+                balance,
+                allocation,
+                surplus,
+                spent,
+                surplus - overspent,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn transfer_exceeding_overspent_surplus_fails() {
+        let balance = Decimal::from(10000u64);
+        let allocation = MAX_ALLOCATION / 2;
+        let overspent = Decimal::from(200u64);
+        let surplus = Decimal::from(500u64);
+        let spent = budget(balance, allocation) + overspent;
+        let available = surplus - overspent;
+        assert!(matches!(
+            invariants::check_transfer_within_surplus(
+                &category_id(0),
+                balance,
+                allocation,
+                surplus,
+                spent,
+                available + Decimal::new(1),
+            ),
+            Err(AccountInvariantError::InsufficientSurplus(id, reported, amount))
+                if id == category_id(0)
+                    && reported == available
+                    && amount == available + Decimal::new(1)
+        ));
+    }
+
+    #[test]
+    fn transfer_from_underfunded_category_fails() {
+        let balance = Decimal::from(10000u64);
+        let allocation = MAX_ALLOCATION / 2;
+        let spent = budget(balance, allocation) + Decimal::from(200u64);
+        assert!(matches!(
+            invariants::check_transfer_within_surplus(
+                &category_id(0),
+                balance,
+                allocation,
+                Decimal::from(100u64),
+                spent,
+                Decimal::from(1u64),
+            ),
+            Err(AccountInvariantError::NegativeSurplus)
+        ));
+    }
+
+    #[test]
     fn debt_repayment_within_owed_passes() {
         assert!(
             invariants::check_debt_within_owed(
-                "loan",
+                &debt_id(0),
                 Decimal::from(1000u64),
                 Decimal::from(400u64)
             )
@@ -1222,7 +1473,7 @@ mod invariants_tests {
     fn debt_repayment_exactly_owed_passes() {
         assert!(
             invariants::check_debt_within_owed(
-                "loan",
+                &debt_id(0),
                 Decimal::from(1000u64),
                 Decimal::from(1000u64)
             )
@@ -1234,11 +1485,11 @@ mod invariants_tests {
     fn debt_repayment_exceeding_owed_fails() {
         assert!(matches!(
             invariants::check_debt_within_owed(
-                "loan",
+                &debt_id(0),
                 Decimal::from(1000u64),
                 Decimal::from(1000u64) + Decimal::new(1),
             ),
-            Err(AccountInvariantError::DebtOverpayment(name, _, _)) if name == "loan"
+            Err(AccountInvariantError::DebtOverpayment(id, _, _)) if id == debt_id(0)
         ));
     }
 }
@@ -1248,12 +1499,21 @@ mod preconditions_tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn categories(names: &[&str]) -> HashMap<String, Spending> {
+    fn category_id(seed: u128) -> CategoryId {
+        CategoryId::from(uuid::Uuid::from_u128(seed))
+    }
+
+    fn debt_id(seed: u128) -> DebtId {
+        DebtId::from(uuid::Uuid::from_u128(seed))
+    }
+
+    fn categories(names: &[&str]) -> HashMap<CategoryId, Spending> {
         names
             .iter()
-            .map(|name| {
+            .enumerate()
+            .map(|(index, _name)| {
                 (
-                    name.to_string(),
+                    category_id(index as u128),
                     Spending {
                         allocation: 10,
                         spent: Decimal::ZERO,
@@ -1268,51 +1528,38 @@ mod preconditions_tests {
     fn missing_category_fails() {
         let categories = categories(&["a"]);
         assert!(matches!(
-            preconditions::check_category_exists("b", &categories),
-            Err(AccountPreconditionError::CategoryNotFound(name)) if name == "b"
+            preconditions::check_category_exists(&category_id(1), &categories),
+            Err(AccountPreconditionError::CategoryNotFound(id)) if id == category_id(1)
         ));
     }
 
     #[test]
     fn existing_category_passes() {
         let categories = categories(&["a"]);
-        assert!(preconditions::check_category_exists("a", &categories).is_ok());
-    }
-
-    #[test]
-    fn duplicate_category_fails() {
-        let categories = categories(&["a"]);
-        assert!(matches!(
-            preconditions::check_category_absent("a", &categories),
-            Err(AccountPreconditionError::DuplicateCategory(name)) if name == "a"
-        ));
-    }
-
-    #[test]
-    fn absent_category_passes() {
-        let categories = categories(&["a"]);
-        assert!(preconditions::check_category_absent("b", &categories).is_ok());
+        assert!(preconditions::check_category_exists(&category_id(0), &categories).is_ok());
     }
 
     #[test]
     fn same_source_and_target_fails() {
         assert!(matches!(
-            preconditions::check_distinct_source_target("a", "a"),
-            Err(AccountPreconditionError::SameCategory(name)) if name == "a"
+            preconditions::check_distinct_source_target(&category_id(0), &category_id(0)),
+            Err(AccountPreconditionError::SameCategory(id)) if id == category_id(0)
         ));
     }
 
     #[test]
     fn distinct_source_and_target_passes() {
-        assert!(preconditions::check_distinct_source_target("a", "b").is_ok());
+        assert!(
+            preconditions::check_distinct_source_target(&category_id(0), &category_id(1)).is_ok()
+        );
     }
 
     #[test]
     fn missing_transfer_source_fails() {
         let categories = categories(&["b"]);
         assert!(matches!(
-            preconditions::check_source_exists("a", &categories),
-            Err(AccountPreconditionError::SourceCategoryNotFound(name)) if name == "a"
+            preconditions::check_source_exists(&category_id(1), &categories),
+            Err(AccountPreconditionError::SourceCategoryNotFound(id)) if id == category_id(1)
         ));
     }
 
@@ -1320,15 +1567,15 @@ mod preconditions_tests {
     fn missing_transfer_target_fails() {
         let categories = categories(&["a"]);
         assert!(matches!(
-            preconditions::check_target_exists("b", &categories),
-            Err(AccountPreconditionError::TargetCategoryNotFound(name)) if name == "b"
+            preconditions::check_target_exists(&category_id(1), &categories),
+            Err(AccountPreconditionError::TargetCategoryNotFound(id)) if id == category_id(1)
         ));
     }
 
     #[test]
     fn mismatched_allocation_count_fails() {
         let categories = categories(&["a"]);
-        let allocations = HashMap::from([("a".to_string(), 10), ("b".to_string(), 10)]);
+        let allocations = HashMap::from([(category_id(0), 10), (category_id(1), 10)]);
         assert!(matches!(
             preconditions::check_categories_match(&categories, &allocations),
             Err(AccountPreconditionError::UnmatchedCategories)
@@ -1338,7 +1585,7 @@ mod preconditions_tests {
     #[test]
     fn mismatched_allocation_names_fails() {
         let categories = categories(&["a"]);
-        let allocations = HashMap::from([("b".to_string(), 10)]);
+        let allocations = HashMap::from([(category_id(1), 10)]);
         assert!(matches!(
             preconditions::check_categories_match(&categories, &allocations),
             Err(AccountPreconditionError::UnmatchedCategories)
@@ -1348,45 +1595,31 @@ mod preconditions_tests {
     #[test]
     fn matching_allocations_pass() {
         let categories = categories(&["a", "b"]);
-        let allocations = HashMap::from([("a".to_string(), 10), ("b".to_string(), 20)]);
+        let allocations = HashMap::from([(category_id(0), 10), (category_id(1), 20)]);
         assert!(preconditions::check_categories_match(&categories, &allocations).is_ok());
     }
 
-    fn debts(names: &[(&str, u64)]) -> HashMap<String, Decimal> {
+    fn debts(names: &[&str]) -> HashMap<DebtId, Decimal> {
         names
             .iter()
-            .map(|(name, amount)| (name.to_string(), Decimal::from(*amount)))
+            .enumerate()
+            .map(|(index, _name)| (debt_id(index as u128), Decimal::from(100u64)))
             .collect()
     }
 
     #[test]
-    fn duplicate_debt_fails() {
-        let debts = debts(&[("loan", 100)]);
-        assert!(matches!(
-            preconditions::check_debt_absent("loan", &debts),
-            Err(AccountPreconditionError::DuplicateDebt(name)) if name == "loan"
-        ));
-    }
-
-    #[test]
-    fn absent_debt_passes() {
-        let debts = debts(&[("loan", 100)]);
-        assert!(preconditions::check_debt_absent("other", &debts).is_ok());
-    }
-
-    #[test]
     fn missing_debt_fails() {
-        let debts = debts(&[("loan", 100)]);
+        let debts = debts(&["loan"]);
         assert!(matches!(
-            preconditions::check_debt_exists("other", &debts),
-            Err(AccountPreconditionError::DebtNotFound(name)) if name == "other"
+            preconditions::check_debt_exists(&debt_id(1), &debts),
+            Err(AccountPreconditionError::DebtNotFound(id)) if id == debt_id(1)
         ));
     }
 
     #[test]
     fn existing_debt_passes() {
-        let debts = debts(&[("loan", 100)]);
-        assert!(preconditions::check_debt_exists("loan", &debts).is_ok());
+        let debts = debts(&["loan"]);
+        assert!(preconditions::check_debt_exists(&debt_id(0), &debts).is_ok());
     }
 }
 

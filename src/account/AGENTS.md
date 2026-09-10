@@ -1,8 +1,9 @@
 ## Domain Models
 
-- Each file exposes a single aggregate root matching its name. Only the
-  aggregate root and its domain events are public; child entity types stay
-  private and never appear in public signatures.
+- Each aggregate lives in its own module folder; its `model.rs` exposes a
+  single aggregate root. Only the aggregate root and its domain events are
+  public; child entity types stay private and never appear in public
+  signatures.
 - Commands use `(&mut self)` and return `Result<T, E>` where `E` is the
   aggregate's umbrella error (e.g. `AccountError`). `T` is situational and
   `()` unless something must be returned. Queries that don't mutate use
@@ -25,16 +26,31 @@
   applies the event and records it. Only validated events are emitted;
   commands validate first and then emit, so a failed command leaves the
   aggregate untouched.
-- `Default` returns an empty aggregate; commands mutate it toward a desired
-  state.
+- `Default` returns an empty aggregate with a freshly minted `AccountId`;
+  commands mutate it toward a desired state.
 - `reconstitute(snapshot, Option<Vec<Event>>) -> Self` is infallible: it
-  trusts persisted state, assigns fields directly and replays trailing events
+  trusts persisted state (including the aggregate id carried by the
+  `...State` DTO), assigns fields directly and replays trailing events
   through `apply` without recording them. To address private field concerns,
   we define public-field DTOs with a `...State` suffix; they carry primitive
   payloads only, keeping the aggregate persistence-ignorant (repositories may
   live outside the crate).
 - Consumption (`spent`) only enters an aggregate through spending commands or
   `reconstitute`.
+- Identity is always a type, never a name. The aggregate-owned id newtypes
+  (`AccountId`, `CategoryId`, `DebtId`) are defined in `model.rs` from the
+  `id_type!` macro in `src/types/id.rs`. Child entities are keyed by
+  aggregate-generated `CategoryId`/`DebtId`; `add_category`/`add_debt`
+  generate them (`new_v7`) and return them. Display names are not domain
+  state; they belong to a read model keyed by id (deferred).
+- Events and snapshots carry ids only. Errors report ids; mapping them to
+  display names is the application's concern.
+- Persistence is event-sourced behind an aggregate-shaped port:
+  `AccountRepository::load` replays `reconstitute` from the stored stream;
+  `save` appends `Account::events()` after checking `Versioned::version`,
+  then calls `Account::mark_committed`. Stream identity and version stay
+  outside the aggregate, and snapshots are an adapter-internal optimization
+  (replay-only for now).
 
 ### Check function structure
 
@@ -53,10 +69,10 @@ fragments, so no candidate state ever needs to be constructed.
   (`check_spending_within_budget`: a category's spending may not exceed its
   budget plus surplus), not after a command that happens to trigger it
   (`check_spend_amount`). One rule serves many commands: `spend`,
-  `transfer_surplus`, `reallocate_categories` and `repay_debt` all
-  call `check_spending_within_budget` with different arguments.
+  `reallocate_categories` and `repay_debt` all call
+  `check_spending_within_budget` with different arguments.
 - **Judged values vs. reported values.** Some parameters decide pass/fail;
-  others exist only so the error can name the offender (`name: &str` in
+  others exist only so the error can name the offender (`id: &CategoryId` in
   `check_spending_within_budget` builds the `SpendingExceedsAllocation`
   payload). Reported values, when present, come first, judged values after,
   so every signature reads "check that for *X*, the rule holds".
@@ -64,9 +80,9 @@ fragments, so no candidate state ever needs to be constructed.
   will be *after* the command, so commands pass post-command values.
 
   Right — `spend`:
-  `check_spending_within_budget(name, balance, allocation, surplus, spending.spent + amount)`
+  `check_spending_within_budget(id, balance, allocation, surplus, spending.spent + amount)`
   Wrong:
-  `check_spending_within_budget(name, balance, allocation, surplus, spending.spent)`
+  `check_spending_within_budget(id, balance, allocation, surplus, spending.spent)`
   The wrong call judges the current state, which is already valid — the
   check would always pass and `spend` could push a category over its
   budget. Likewise `remove_funds` passes `(self.balance, amount)`:
@@ -97,10 +113,11 @@ fragments, so no candidate state ever needs to be constructed.
 - **Non-trivial derivation is shared with `apply` — or it is a single
   expression.** Validation must never compute a value that `apply` also
   computes independently; the two would drift and the command would
-  validate a fiction. `rollover` and `apply` therefore share
-  `rollover_increment` and `flushed_total` for the flush math. A one-op
-  mirror like `spend`'s `spent + amount` may stay inline: it is a single
-  expression that visibly corresponds to `apply`'s `spent += amount`.
+  validate a fiction. `remove_category` and `apply` therefore share
+  `removal_balance`, and `rollover` and `apply` share `total_budget` and
+  `budget` for the flush math. A one-op mirror like `spend`'s
+  `spent + amount` may stay inline: it is a single expression that
+  visibly corresponds to `apply`'s `spent += amount`.
 - **Overflow safety belongs to the check, not the caller.** A check never
   forces a command to widen a value. Either the operation is infallible in
   practice (addition of `Decimal` amounts cannot underflow and cannot
@@ -115,7 +132,7 @@ fragments, so no candidate state ever needs to be constructed.
   their natural narrow types.
 - **Preconditions are the mirror image.** They ask whether the command
   makes sense *now*: their state parameters are current values
-  (`check_category_exists(name, categories)` looks at the map as it is),
+  (`check_category_exists(id, categories)` looks at the map as it is),
   and they may receive command arguments directly
   (`check_non_negative_amount(amount)` involves no state at all).
 
