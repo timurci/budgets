@@ -8,7 +8,18 @@ use thiserror::Error;
 const SCALE: u8 = 8;
 const SCALE_FACTOR: u64 = 100_000_000;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct Decimal(u64);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
@@ -31,6 +42,11 @@ pub enum DecimalError {
 
 impl Decimal {
     pub const ZERO: Self = Self(0);
+
+    /// Number of decimal places the raw representation is scaled by.
+    pub const fn scale() -> u8 {
+        SCALE
+    }
 
     pub const fn new(raw: u64) -> Self {
         Self(raw)
@@ -152,7 +168,7 @@ impl fmt::Display for Decimal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let units = self.0 / SCALE_FACTOR;
         let fraction = self.0 % SCALE_FACTOR;
-        let width = usize::from(SCALE);
+        let width = usize::from(Self::scale());
         write!(f, "{units}.{fraction:0width$}")
     }
 }
@@ -190,7 +206,8 @@ fn parse_fraction(fraction: &str) -> Result<u64, ParseDecimalError> {
     if fraction.is_empty() {
         return Err(ParseDecimalError::InvalidFormat);
     }
-    if fraction.len() > usize::from(SCALE) {
+    let scale = Decimal::scale();
+    if fraction.len() > usize::from(scale) {
         return Err(ParseDecimalError::TooManyDecimalPlaces);
     }
     if !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -199,7 +216,7 @@ fn parse_fraction(fraction: &str) -> Result<u64, ParseDecimalError> {
     let mut value = fraction
         .parse::<u64>()
         .map_err(|_| ParseDecimalError::InvalidFormat)?;
-    for _ in fraction.len()..usize::from(SCALE) {
+    for _ in fraction.len()..usize::from(scale) {
         value *= 10;
     }
     Ok(value)
@@ -242,6 +259,11 @@ mod construction_tests {
     #[test]
     fn as_raw_exposes_internal_value() {
         assert_eq!(Decimal::new(123).as_raw(), 123);
+    }
+
+    #[test]
+    fn scale_is_eight() {
+        assert_eq!(Decimal::scale(), 8);
     }
 
     #[test]

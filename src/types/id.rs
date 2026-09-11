@@ -1,7 +1,18 @@
 macro_rules! id_type {
     ($($name:ident),+ $(,)?) => {
         $(
-            #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+            #[derive(
+                Clone,
+                Copy,
+                Debug,
+                PartialEq,
+                Eq,
+                Hash,
+                PartialOrd,
+                Ord,
+                serde::Serialize,
+                serde::Deserialize,
+            )]
             pub struct $name(uuid::Uuid);
 
             impl $name {
